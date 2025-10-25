@@ -1,0 +1,8 @@
+[project]
+name = "angr-mcp"
+version = "0.1.0"
+description = "MCP server exposing angr functionality"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = true
