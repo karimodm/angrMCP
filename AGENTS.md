@@ -17,17 +17,24 @@ for future human or agent contributors working on the angr MCP server project.
 ## Repository Layout Snapshot
 
 - `angr_mcp/` – MCP server implementation and runtime registry.
-- `awesome-angr/` – Community exploration techniques dynamically imported by
-  the server when requested.
-- `angr/` – Upstream angr source tree (currently unused for installs; PyPI
-  packages are consumed instead).
+- `resources/` – Bundled reference material and companion codebases:
+  - `resources/angr` – Upstream angr source tree (currently unused for installs;
+    PyPI packages are consumed instead).
+  - `resources/awesome-angr` – Community exploration techniques dynamically
+    imported by the server when requested.
+  - `resources/angr_ctf` – Capture-the-flag training levels and build scripts
+    for learning angr-based symbolic exploitation (MetaCTF workshop content).
+  - `resources/dAngr` – dAngr examples and docs for additional exploration
+    strategies.
+  - `resources/GhidraMCP` – Shared assets for coordinating workflows with the
+    Ghidra MCP server.
 - `tests/test_mcp_server.py` – Integration tests; doubles as executable
   examples for the handler workflow.
 - `pyproject.toml` – Minimal configuration for `uv` environment management.
 
 ## Implemented Workflow (Session Summary)
 
-1. Explored bundled angr documentation and awesome-angr resources to scope key
+1. Explored bundled angr documentation and `resources/awesome-angr` techniques to scope key
    capabilities for MCP exposure.
 2. Implemented the MCP server core:
    - Registry tracking projects, states, simulation managers, hooks, monitors.
@@ -36,10 +43,18 @@ for future human or agent contributors working on the angr MCP server project.
    - Dynamic loading of exploration techniques with resilient error handling.
 3. Added error-tolerant execution (capturing exceptions and returning them in
    handler responses) and stash-safe state collection.
-4. Wrote integration tests compiling a sample binary that requires discovering
+4. Implemented structured alerting for unconstrained instruction pointers and
+   suspicious memory writes; alerts accumulate per state and surface in run
+   results and inspections.
+5. Introduced job persistence: `run_symbolic_search` now issues job handles,
+   jobs can be listed/resumed/deleted, and persisted snapshots live under
+   `.mcp_jobs/`.
+6. Authored JSON Schemas for every handler request/response in `schemas/` to
+   aid downstream validation.
+7. Wrote integration tests compiling a sample binary that requires discovering
    the string “AB” to reach a `win` function; tests cover hooking, exploration,
-   constraint solving, monitoring, CFG, and slicing.
-5. Provisioned a `uv`-managed virtual environment and documented setup in the
+   constraint solving, monitoring, alerts, job persistence, CFG, and slicing.
+8. Provisioned a `uv`-managed virtual environment and documented setup in the
    README.
 
 ## Collaboration Rules
@@ -62,13 +77,13 @@ for future human or agent contributors working on the angr MCP server project.
 ## Open Opportunities
 
 - Expand monitoring hooks to automatically flag patterns like unconstrained
-  instruction pointers or suspect stack writes.
-- Provide structured schemas for handler inputs/outputs to aid client
-  integration.
-- Support long-running background analyses with resumable job IDs.
+  stack pivots or self-modifying code.
+- Support long-running background analyses with resumable job IDs executed in
+  the background and polled via metadata.
+- Automate JSON Schema generation from source annotations and enforce
+  validation in CI once `jsonschema` is bundled.
 - Enhance tests with multiple architectures and binaries once additional
   dependencies are in place.
 
 Keep this guide synchronized with actual project state after each session so
 future agents can resume work without rediscovering context.
-
