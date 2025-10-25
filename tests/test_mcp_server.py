@@ -7,6 +7,11 @@ import tempfile
 import textwrap
 import unittest
 
+import pathlib
+from types import SimpleNamespace
+
+import claripy
+
 from angr_mcp import AngrMCPServer
 from angr_mcp.registry import registry
 
@@ -78,6 +83,9 @@ class TestAngrMCPServer(unittest.TestCase):
 
     def tearDown(self) -> None:
         registry.reset()
+        job_dir = pathlib.Path(".mcp_jobs")
+        if job_dir.exists():
+            shutil.rmtree(job_dir)
 
     # ------------------------------------------------------------------
     def test_load_and_setup(self) -> None:
@@ -133,6 +141,86 @@ class TestAngrMCPServer(unittest.TestCase):
         inspected = self.server.inspect_state(self.project_id, state_id, include_events=True)
         self.assertIn("events", inspected)
         self.assertTrue(inspected["events"], "Expected mem_write events to be recorded")
+
+    # ------------------------------------------------------------------
+    def test_alert_detection_and_inspection(self) -> None:
+        ctx = registry.get_project(self.project_id)
+        setup = self.server.setup_symbolic_context(self.project_id, kind="entry", stdin_symbolic=4)
+        state_id = setup["state_id"]
+        state = registry.get_state(self.project_id, state_id)
+
+        sym_ip = claripy.BVS("sym_ip", ctx.project.arch.bits)
+        state.regs.ip = sym_ip
+        sp_val = state.solver.eval(state.regs.sp)
+        state.globals["_mcp_recent_actions"] = [
+            SimpleNamespace(
+                type="mem",
+                action="write",
+                addr=claripy.BVV(sp_val, ctx.project.arch.bits),
+                size=claripy.BVV(4, ctx.project.arch.bits),
+                data=claripy.BVS("mem_write", 32),
+            )
+        ]
+
+        alerts = self.server._run_alert_detectors(ctx, self.project_id, state_id, state)
+        alert_kinds = {entry["type"] for entry in alerts}
+        self.assertIn("unconstrained_ip", alert_kinds)
+        self.assertIn("mem_write", alert_kinds)
+
+        run_info = self.server.run_symbolic_search(
+            self.project_id,
+            state_id=state_id,
+            mode="step",
+            step_count=1,
+        )
+        returned_alerts = {entry["type"] for entry in run_info["run"]["alerts"]}
+        self.assertTrue(returned_alerts, "Expected alerts to accompany run results")
+        self.assertIn("unconstrained_ip", returned_alerts)
+
+        inspected = self.server.inspect_state(
+            self.project_id,
+            state_id,
+            include_alerts=True,
+        )
+        self.assertIn("alerts", inspected)
+        self.assertTrue(inspected["alerts"])
+
+    # ------------------------------------------------------------------
+    def test_job_persistence_roundtrip(self) -> None:
+        setup = self.server.setup_symbolic_context(self.project_id, kind="entry", stdin_symbolic=4)
+        initial_run = self.server.run_symbolic_search(
+            self.project_id,
+            state_id=setup["state_id"],
+            mode="step",
+            step_count=1,
+        )
+        run_payload = initial_run["run"]
+        job_id = run_payload["job_id"]
+        self.assertIsNotNone(job_id)
+
+        jobs = self.server.list_jobs(self.project_id)["jobs"]
+        self.assertTrue(any(job["job_id"] == job_id for job in jobs))
+
+        persisted_run = self.server.run_symbolic_search(
+            self.project_id,
+            simgr_id=run_payload["simgr_id"],
+            job_id=job_id,
+            mode="step",
+            step_count=1,
+            persist_job=True,
+        )
+        self.assertEqual(persisted_run["run"]["job_id"], job_id)
+
+        job_path = pathlib.Path(".mcp_jobs") / f"{job_id}.json"
+        self.assertTrue(job_path.exists(), "Expected persisted job artifact on disk")
+
+        registry.delete_job(self.project_id, job_id)
+        resume_info = self.server.resume_job(self.project_id, job_id)
+        self.assertEqual(resume_info["job"]["job_id"], job_id)
+        self.assertTrue(resume_info["simgr_id"])
+
+        self.server.delete_job(self.project_id, job_id, remove_disk=True)
+        self.assertFalse(job_path.exists())
 
     # ------------------------------------------------------------------
     def test_cfg_and_slice(self) -> None:

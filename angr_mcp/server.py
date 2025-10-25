@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
+import base64
 import importlib
 import importlib.util
+import json
 import pathlib
+import pickle
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import angr
 import claripy
 
 import angr.exploration_techniques
 
-from .registry import HookDescriptor, registry
+from .registry import AlertRecord, HookDescriptor, JobContext, ProjectContext, registry
+from .utils import (
+    SYMBOL_STORE_KEY,
+    StateMutationResult,
+    mutate_registers,
+    mutate_stack,
+    new_symbolic_bitvector,
+)
 
 
 @dataclass
@@ -26,6 +37,104 @@ class RunResult:
     avoided: List[str]
     errored: List[str]
     errors: List[Dict[str, str]]
+    alerts: List[Dict[str, Any]]
+    job_id: Optional[str] = None
+    stashes: Optional[Dict[str, List[str]]] = None
+    streams: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    predicate_matches: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class PredicateEngine:
+    """Compile structured predicate descriptors into angr-compatible callables."""
+
+    def __init__(self, role: str, descriptors: Sequence[Dict[str, Any]]):
+        self.role = role
+        self.descriptors = list(descriptors)
+        self._address_map: Dict[int, List[Dict[str, Any]]] = {}
+        self._predicate_specs: List[Dict[str, Any]] = []
+        self._pending: Dict[int, List[Dict[str, Any]]] = {}
+        self.matches: List[Dict[str, Any]] = []
+
+        for descriptor in self.descriptors:
+            if descriptor["kind"] == "address":
+                addr = int(descriptor["address"])
+                self._address_map.setdefault(addr, []).append(descriptor)
+            else:
+                self._predicate_specs.append(descriptor)
+
+    def has_predicates(self) -> bool:
+        return bool(self._address_map or self._predicate_specs)
+
+    def as_callable(self) -> Optional[Callable[[angr.SimState], bool]]:
+        if not self.has_predicates():
+            return None
+
+        def _predicate(state: angr.SimState) -> bool:
+            matched = False
+            state_addr = int(getattr(state, "addr", 0) or 0)
+            if state_addr in self._address_map:
+                for descriptor in self._address_map[state_addr]:
+                    self._record_match(descriptor, state, {"address": state_addr})
+                matched = True
+
+            for descriptor in self._predicate_specs:
+                if self._evaluate_descriptor(state, descriptor):
+                    matched = True
+
+            return matched
+
+        return _predicate
+
+    def bind_state(self, state: angr.SimState, state_id: str) -> None:
+        """Associate pending predicate matches with a concrete state identifier."""
+
+        bucket = self._pending.pop(id(state), [])
+        for entry in bucket:
+            entry["state_id"] = state_id
+            self.matches.append(entry)
+
+    # ------------------------------------------------------------------
+    def _record_match(self, descriptor: Dict[str, Any], state: angr.SimState, details: Dict[str, Any]) -> None:
+        entry = {
+            "predicate_id": descriptor["id"],
+            "kind": descriptor["kind"],
+            "role": self.role,
+            "state_id": None,
+            "state_addr": int(getattr(state, "addr", 0) or 0),
+            "details": details,
+        }
+        self._pending.setdefault(id(state), []).append(entry)
+
+    def _evaluate_descriptor(self, state: angr.SimState, descriptor: Dict[str, Any]) -> bool:
+        kind = descriptor["kind"]
+        if kind in {"stdout_contains", "stdout_not_contains"}:
+            stream_name = descriptor.get("stream", "stdout")
+            fd = 1 if stream_name == "stdout" else 2
+            try:
+                data = state.posix.dumps(fd)
+            except Exception:  # pylint:disable=broad-except
+                data = b""
+
+            needle: bytes = descriptor["needle"]
+            contains = needle in data
+            matched = contains
+            violation = False
+            if kind == "stdout_not_contains":
+                violation = contains
+                matched = contains
+            if matched:
+                snippet = data[-64:]
+                details = {
+                    "stream": stream_name,
+                    "needle_b64": base64.b64encode(needle).decode("ascii"),
+                    "snippet_b64": base64.b64encode(snippet).decode("ascii"),
+                }
+                if violation:
+                    details["violation"] = True
+                self._record_match(descriptor, state, details)
+            return matched
+
+        raise ValueError(f"unsupported predicate kind: {kind}")
 
 
 class AngrMCPServer:
@@ -68,6 +177,122 @@ class AngrMCPServer:
         }
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _option_name(option: Any) -> str:
+        return getattr(option, "name", str(option))
+
+    def _resolve_state_options(self, options: Optional[Iterable[Any]]) -> List[Any]:
+        resolved: List[Any] = []
+        for opt in options or []:
+            if isinstance(opt, str):
+                if not hasattr(angr.options, opt):
+                    raise ValueError(f"unknown angr option: {opt}")
+                resolved.append(getattr(angr.options, opt))
+            else:
+                resolved.append(opt)
+        return resolved
+
+    def _normalize_predicate_specs(
+        self,
+        specs: Optional[Sequence[Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        runtime: List[Dict[str, Any]] = []
+        serialized: List[Dict[str, Any]] = []
+        for entry in specs or []:
+            descriptor: Dict[str, Any]
+            if isinstance(entry, int):
+                descriptor = {
+                    "id": str(uuid.uuid4()),
+                    "kind": "address",
+                    "address": int(entry),
+                    "description": f"address:{entry:#x}",
+                }
+            elif isinstance(entry, dict):
+                kind = entry.get("kind")
+                if kind == "address":
+                    address = int(entry["address"])
+                    descriptor = {
+                        "id": entry.get("id", str(uuid.uuid4())),
+                        "kind": "address",
+                        "address": address,
+                        "description": entry.get("description", f"address:{address:#x}"),
+                    }
+                elif kind in {"stdout_contains", "stdout_not_contains"}:
+                    text = entry.get("text") or entry.get("value") or entry.get("needle")
+                    if isinstance(text, bytes):
+                        needle = text
+                        text_str = text.decode("utf-8", errors="replace")
+                    else:
+                        text_str = str(text)
+                        needle = text_str.encode("utf-8")
+                    descriptor = {
+                        "id": entry.get("id", str(uuid.uuid4())),
+                        "kind": kind,
+                        "needle": needle,
+                        "text": text_str,
+                        "stream": entry.get("stream", "stdout"),
+                    }
+                else:
+                    raise ValueError(f"unsupported predicate descriptor: {entry}")
+            else:
+                raise TypeError(f"unsupported predicate entry: {entry!r}")
+
+            runtime.append(descriptor)
+            serialized.append(self._serialize_predicate_descriptor(descriptor))
+
+        return runtime, serialized
+
+    @staticmethod
+    def _serialize_predicate_descriptor(descriptor: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "id": descriptor["id"],
+            "kind": descriptor["kind"],
+        }
+        if descriptor["kind"] == "address":
+            payload["address"] = int(descriptor["address"])
+            payload["description"] = descriptor.get("description")
+        else:
+            payload["text"] = descriptor.get("text")
+            payload["stream"] = descriptor.get("stream")
+            payload["needle_b64"] = base64.b64encode(descriptor["needle"]).decode("ascii")
+        return payload
+
+    @staticmethod
+    def _apply_symbolic_memory(state: angr.SimState, specs: Optional[Iterable[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for spec in specs or []:
+            address = int(spec["address"])
+            size = int(spec["size"])
+            label = spec.get("label", f"mem_{address:#x}")
+            bits = size * 8
+            symbol, metadata = new_symbolic_bitvector(state, label, bits, handle_prefix="mem")
+            state.memory.store(address, symbol)
+            entry = {"address": address, "size": size}
+            entry.update(metadata)
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _dump_streams(state: angr.SimState) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for fd, name in ((0, "stdin"), (1, "stdout"), (2, "stderr")):
+            try:
+                data = state.posix.dumps(fd)
+            except Exception:  # pylint:disable=broad-except
+                data = b""
+            if not data:
+                continue
+            mapping[name] = base64.b64encode(data).decode("ascii")
+        return mapping
+
+    @staticmethod
+    def _resolve_symbol_handle(state: angr.SimState, handle: str) -> claripy.ast.BV:
+        store = state.globals.get(SYMBOL_STORE_KEY, {})
+        if handle not in store:
+            raise KeyError(f"unknown symbolic handle: {handle}")
+        return store[handle]
+
+    # ------------------------------------------------------------------
     def load_project(
         self,
         binary_path: str,
@@ -107,6 +332,9 @@ class AngrMCPServer:
         stdin_symbolic: Optional[int] = None,
         symbolic_memory: Optional[List[Dict[str, Any]]] = None,
         symbolic_registers: Optional[List[Dict[str, Any]]] = None,
+        stack_mutations: Optional[List[Dict[str, Any]]] = None,
+        add_options: Optional[Iterable[Any]] = None,
+        remove_options: Optional[Iterable[Any]] = None,
     ) -> Dict[str, Any]:
         """Create and register a symbolic state."""
 
@@ -114,40 +342,62 @@ class AngrMCPServer:
         project = ctx.project
         factory = project.factory
 
+        add_opts = set(self._resolve_state_options(add_options))
+        remove_opts = set(self._resolve_state_options(remove_options))
+        state_kwargs: Dict[str, Any] = {}
+        if add_opts:
+            state_kwargs["add_options"] = add_opts
+        if remove_opts:
+            state_kwargs["remove_options"] = remove_opts
+
         if kind == "entry":
-            state = factory.entry_state(args=argv, env=env)
+            state = factory.entry_state(args=argv, env=env, **state_kwargs)
         elif kind == "full_init":
-            state = factory.full_init_state(args=argv, env=env)
+            state = factory.full_init_state(args=argv, env=env, **state_kwargs)
         elif kind == "blank":
-            state = factory.blank_state(addr=addr)
+            state = factory.blank_state(addr=addr, **state_kwargs)
         elif kind == "call":
             if addr is None:
                 raise ValueError("call state requires addr")
             call_args = [] if args is None else list(args)
-            state = factory.call_state(addr, *call_args)
+            state = factory.call_state(addr, *call_args, **state_kwargs)
         else:
             raise ValueError(f"unknown state kind: {kind}")
 
         if stdin_symbolic:
-            sym_stdin = claripy.BVS(f"stdin_{uuid.uuid4().hex}", stdin_symbolic * 8)
+            sym_stdin, stdin_meta = new_symbolic_bitvector(
+                state,
+                f"stdin_{uuid.uuid4().hex}",
+                stdin_symbolic * 8,
+                handle_prefix="stdin",
+            )
             stdin_stream = state.posix.stdin
             size_bv = claripy.BVV(stdin_symbolic, state.arch.bits)
             stdin_stream.content = [(sym_stdin, size_bv)]
             stdin_stream.pos = 0
             stdin_stream.write_mode = False
+            stdin_entry = {
+                "stream": "stdin",
+                "bits": stdin_symbolic * 8,
+            }
+            stdin_entry.update(stdin_meta)
+        else:
+            stdin_entry = None
 
-        for spec in symbolic_memory or []:
-            name = spec.get("name", f"mem_{spec['address']:#x}")
-            size = spec["size"]
-            addr_spec = spec["address"]
-            sym = claripy.BVS(f"{name}_{uuid.uuid4().hex}", size * 8)
-            state.memory.store(addr_spec, sym)
+        mutation_summary = StateMutationResult()
+        if add_opts or remove_opts:
+            mutation_summary.add_options(
+                added=[self._option_name(opt) for opt in add_opts],
+                removed=[self._option_name(opt) for opt in remove_opts],
+            )
 
-        for spec in symbolic_registers or []:
-            reg_name = spec["name"]
-            size = spec.get("size", project.arch.bytes)
-            sym = claripy.BVS(f"{reg_name}_{uuid.uuid4().hex}", size * 8)
-            setattr(state.regs, reg_name, sym)
+        mem_entries = self._apply_symbolic_memory(state, symbolic_memory)
+
+        if symbolic_registers:
+            mutate_registers(state, symbolic_registers, result=mutation_summary)
+
+        if stack_mutations:
+            mutate_stack(state, stack_mutations, result=mutation_summary)
 
         state_id = registry.register_state(project_id, state)
 
@@ -158,10 +408,31 @@ class AngrMCPServer:
             "bp": solver.eval(state.regs.bp) if hasattr(state.regs, "bp") else None,
         }
 
-        return {
+        symbolic_payload: Dict[str, Any] = {}
+        if stdin_entry:
+            symbolic_payload.setdefault("stdin", []).append(stdin_entry)
+        register_symbols = [entry for entry in mutation_summary.registers if entry.get("handle")]
+        if register_symbols:
+            symbolic_payload["registers"] = register_symbols
+        stack_symbols = [
+            entry.as_dict() for entry in mutation_summary.stack if entry.handle is not None
+        ]
+        if stack_symbols:
+            symbolic_payload["stack"] = stack_symbols
+        if mem_entries:
+            symbolic_payload["memory"] = mem_entries
+
+        response = {
             "state_id": state_id,
             "registers": register_snapshot,
         }
+        mutations_dict = mutation_summary.to_dict()
+        if mutations_dict:
+            response["mutations"] = mutations_dict
+        if symbolic_payload:
+            response["symbolic"] = symbolic_payload
+
+        return response
 
     # ------------------------------------------------------------------
     def instrument_environment(
@@ -219,34 +490,144 @@ class AngrMCPServer:
         return {"hooks": applied}
 
     # ------------------------------------------------------------------
+    def mutate_state(
+        self,
+        project_id: str,
+        state_id: str,
+        *,
+        registers: Optional[List[Dict[str, Any]]] = None,
+        stack: Optional[List[Dict[str, Any]]] = None,
+        memory: Optional[List[Dict[str, Any]]] = None,
+        add_options: Optional[Iterable[Any]] = None,
+        remove_options: Optional[Iterable[Any]] = None,
+    ) -> Dict[str, Any]:
+        state = registry.get_state(project_id, state_id)
+        mutation_summary = StateMutationResult()
+
+        if registers:
+            mutate_registers(state, registers, result=mutation_summary)
+        if stack:
+            mutate_stack(state, stack, result=mutation_summary)
+
+        memory_entries: List[Dict[str, Any]] = []
+        for spec in memory or []:
+            address = int(spec["address"])
+            size = int(spec["size"])
+            if "value" in spec:
+                value = int(spec["value"])
+                bv = claripy.BVV(value, size * 8)
+                state.memory.store(address, bv)
+                memory_entries.append({"address": address, "size": size, "value": value})
+            elif "symbolic" in spec:
+                sym_spec = dict(spec["symbolic"])
+                label = sym_spec.get("label", f"mem_{address:#x}")
+                bits = int(sym_spec.get("bits", size * 8))
+                symbol, metadata = new_symbolic_bitvector(state, label, bits, handle_prefix="mem")
+                state.memory.store(address, symbol)
+                entry = {"address": address, "size": size}
+                entry.update(metadata)
+                memory_entries.append(entry)
+            else:
+                raise ValueError(f"unsupported memory mutation: {spec!r}")
+        for entry in memory_entries:
+            mutation_summary.add_memory_entry(entry)
+
+        add_opts = set(self._resolve_state_options(add_options))
+        remove_opts = set(self._resolve_state_options(remove_options))
+        if add_opts:
+            state.options.update(add_opts)
+        if remove_opts:
+            state.options.difference_update(remove_opts)
+        if add_opts or remove_opts:
+            mutation_summary.add_options(
+                added=[self._option_name(opt) for opt in add_opts],
+                removed=[self._option_name(opt) for opt in remove_opts],
+            )
+
+        response = mutation_summary.to_dict()
+
+        symbolic_payload: Dict[str, Any] = {}
+        register_symbols = [entry for entry in mutation_summary.registers if entry.get("handle")]
+        if register_symbols:
+            symbolic_payload["registers"] = register_symbols
+        stack_symbols = [
+            entry.as_dict() for entry in mutation_summary.stack if entry.handle is not None
+        ]
+        if stack_symbols:
+            symbolic_payload["stack"] = stack_symbols
+        memory_symbols = [entry for entry in mutation_summary.memory if entry.get("handle")]
+        if memory_symbols:
+            symbolic_payload["memory"] = memory_symbols
+        if symbolic_payload:
+            response["symbolic"] = symbolic_payload
+
+        return response
+
+    # ------------------------------------------------------------------
     def run_symbolic_search(
         self,
         project_id: str,
         *,
         state_id: Optional[str] = None,
         simgr_id: Optional[str] = None,
+        job_id: Optional[str] = None,
         mode: str = "explore",
         find: Optional[List[int]] = None,
         avoid: Optional[List[int]] = None,
         step_count: int = 1,
         techniques: Optional[List[str]] = None,
+        persist_job: bool = False,
+        job_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         ctx = registry.get_project(project_id)
         project = ctx.project
 
+        job_ctx: Optional[JobContext] = None
+
+        find_runtime, find_serialized = self._normalize_predicate_specs(find)
+        avoid_runtime, avoid_serialized = self._normalize_predicate_specs(avoid)
+        find_engine = PredicateEngine("find", find_runtime)
+        avoid_engine = PredicateEngine("avoid", avoid_runtime)
+        find_callable = find_engine.as_callable()
+        avoid_callable = avoid_engine.as_callable()
+
+        if job_id:
+            try:
+                job_ctx = registry.get_job(project_id, job_id)
+            except KeyError:
+                job_ctx = self._load_job_from_disk(project_id, job_id)
+
+        if job_ctx is not None:
+            simgr_id = job_ctx.simgr_id
+
         if simgr_id:
             simgr = registry.get_simmanager(project_id, simgr_id)
+            if job_ctx is None:
+                job_ctx = self._find_job_by_simgr(project_id, simgr_id)
         else:
             if state_id is None:
                 raise ValueError("state_id required when creating new sim manager")
             state = registry.get_state(project_id, state_id)
             simgr = project.factory.simulation_manager(state)
             simgr_id = registry.register_simmanager(project_id, simgr)
+            if job_ctx is None and job_id:
+                # a job was requested but no persisted state existed; initialize a new job context shell
+                job_ctx = registry.register_job(
+                    project_id,
+                    simgr_id,
+                    job_id=job_id,
+                    metadata={"note": "job initialized from fresh state"},
+                )
 
         for tech_name in techniques or []:
             technique = self._load_technique(tech_name, project)
             if technique is not None:
                 simgr.use_technique(technique)
+
+        state_callbacks: List[Callable[[angr.SimState, str], None]] = []
+        for engine in (find_engine, avoid_engine):
+            if engine.has_predicates():
+                state_callbacks.append(engine.bind_state)
 
         caught_errors: List[Dict[str, str]] = []
         try:
@@ -254,14 +635,90 @@ class AngrMCPServer:
                 for _ in range(step_count):
                     simgr.step()
             elif mode == "explore":
-                simgr.explore(find=find, avoid=avoid)
+                explore_kwargs: Dict[str, Any] = {}
+                if find_engine.has_predicates():
+                    explore_kwargs["find"] = find_callable
+                if avoid_engine.has_predicates():
+                    explore_kwargs["avoid"] = avoid_callable
+                simgr.explore(**explore_kwargs)
             else:
                 raise ValueError(f"unknown mode: {mode}")
         except Exception as exc:  # pylint:disable=broad-except
             caught_errors.append({"type": type(exc).__name__, "message": str(exc)})
 
-        result = self._collect_run_result(project_id, simgr_id, simgr, extra_errors=caught_errors)
-        return {"run": result.__dict__}
+        result = self._collect_run_result(
+            project_id,
+            simgr_id,
+            simgr,
+            extra_errors=caught_errors,
+            state_callbacks=state_callbacks,
+        )
+        predicate_matches: List[Dict[str, Any]] = []
+        if find_engine.has_predicates():
+            predicate_matches.extend(find_engine.matches)
+        if avoid_engine.has_predicates():
+            predicate_matches.extend(avoid_engine.matches)
+        result.predicate_matches = predicate_matches
+
+        stash_map = result.stashes or {
+            "active": result.active,
+            "deadended": result.deadended,
+            "found": result.found,
+            "avoided": result.avoided,
+            "errored": result.errored,
+        }
+        all_state_ids = sorted({sid for sids in stash_map.values() for sid in sids})
+
+        metadata_payload = {
+            "last_run": {
+                "mode": mode,
+                "step_count": step_count,
+                "find": find_serialized,
+                "avoid": avoid_serialized,
+                "techniques": list(techniques or []),
+                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                "alerts": result.alerts,
+                "errors": result.errors,
+            },
+            "stashes": stash_map,
+            "predicates": {
+                "find": find_serialized,
+                "avoid": avoid_serialized,
+                "matches": predicate_matches,
+            },
+        }
+        if job_metadata:
+            metadata_payload.update(job_metadata)
+
+        if job_ctx is None:
+            job_ctx = registry.register_job(
+                project_id,
+                simgr_id,
+                state_ids=all_state_ids,
+                metadata=metadata_payload,
+            )
+        else:
+            merged_state_ids = sorted(set(job_ctx.state_ids).union(all_state_ids))
+            job_ctx = registry.update_job(
+                project_id,
+                job_ctx.job_id,
+                state_ids=merged_state_ids,
+                metadata=metadata_payload,
+            )
+
+        if persist_job:
+            self._persist_job(project_id, job_ctx, stash_map)
+            job_ctx = registry.update_job(
+                project_id,
+                job_ctx.job_id,
+                metadata={"persisted": True},
+            )
+
+        result.job_id = job_ctx.job_id
+        result.stashes = stash_map
+
+        run_payload = dict(result.__dict__)
+        return {"run": run_payload}
 
     # ------------------------------------------------------------------
     def monitor_for_vulns(
@@ -271,7 +728,8 @@ class AngrMCPServer:
         events: List[str],
     ) -> Dict[str, Any]:
         state = registry.get_state(project_id, state_id)
-        log: List[Dict[str, Any]] = []
+        monitor = registry.ensure_monitor(project_id, state_id)
+        monitor.events.clear()
 
         def make_callback(event_name: str):
             def _callback(state: angr.SimState) -> None:
@@ -282,15 +740,41 @@ class AngrMCPServer:
                     length_ast = state.inspect.mem_write_length
                     entry["address"] = solver.eval(addr_ast)
                     entry["length"] = solver.eval(length_ast)
-                log.append(entry)
+                registry.record_event(project_id, state_id, entry)
 
             return _callback
 
         for event_name in events:
             state.inspect.b(event_name, when=angr.BP_AFTER, action=make_callback(event_name))
 
-        registry.get_project(project_id).monitors[state_id] = log
         return {"monitored_events": events}
+
+    # ------------------------------------------------------------------
+    def list_jobs(self, project_id: str) -> Dict[str, Any]:
+        jobs = [self._job_to_dict(job) for job in registry.list_jobs(project_id).values()]
+        return {"jobs": jobs}
+
+    # ------------------------------------------------------------------
+    def resume_job(self, project_id: str, job_id: str) -> Dict[str, Any]:
+        try:
+            job_ctx = registry.get_job(project_id, job_id)
+        except KeyError:
+            job_ctx = self._load_job_from_disk(project_id, job_id)
+
+        return {
+            "job": self._job_to_dict(job_ctx),
+            "simgr_id": job_ctx.simgr_id,
+        }
+
+    # ------------------------------------------------------------------
+    def delete_job(self, project_id: str, job_id: str, *, remove_disk: bool = False) -> Dict[str, Any]:
+        job_ctx = registry.get_job(project_id, job_id)
+        if remove_disk and job_ctx.backing_path:
+            path = pathlib.Path(job_ctx.backing_path)
+            if path.exists():
+                path.unlink()
+        registry.delete_job(project_id, job_id)
+        return {"deleted": job_id}
 
     # ------------------------------------------------------------------
     def inspect_state(
@@ -302,6 +786,7 @@ class AngrMCPServer:
         memory: Optional[List[Dict[str, int]]] = None,
         include_constraints: bool = False,
         include_events: bool = False,
+        include_alerts: bool = False,
     ) -> Dict[str, Any]:
         state = registry.get_state(project_id, state_id)
         data: Dict[str, Any] = {}
@@ -335,9 +820,14 @@ class AngrMCPServer:
             constraints = [str(c) for c in state.solver.constraints]
             data["constraints"] = constraints
 
-        if include_events:
+        if include_events or include_alerts:
             ctx = registry.get_project(project_id)
-            data["events"] = ctx.monitors.get(state_id, [])
+            monitor = ctx.monitors.get(state_id)
+            if include_events:
+                data["events"] = monitor.events if monitor else []
+            if include_alerts:
+                alerts = monitor.alerts if monitor else []
+                data["alerts"] = [self._alert_to_dict(alert) for alert in alerts]
 
         return data
 
@@ -356,17 +846,29 @@ class AngrMCPServer:
                 addr = query["address"]
                 size = query["size"]
                 ast = state.memory.load(addr, size)
+                item = {"kind": kind, "address": addr, "size": size}
             elif kind == "register":
                 reg = query["name"]
                 ast = getattr(state.regs, reg)
+                item = {"kind": kind, "name": reg}
+            elif kind == "symbol":
+                handle = query["handle"]
+                ast = self._resolve_symbol_handle(state, handle)
+                item = {"kind": kind, "handle": handle, "bits": ast.size()}
             else:
                 raise ValueError(f"unsupported query kind: {kind}")
 
-            item = {"kind": kind}
             item["value"] = state.solver.eval(ast)
             if query.get("minmax"):
                 item["min"] = state.solver.min(ast)
                 item["max"] = state.solver.max(ast)
+            if query.get("format") == "bytes" or query.get("include_bytes"):
+                try:
+                    concrete_bytes = state.solver.eval(ast, cast_to=bytes)
+                except Exception:  # pylint:disable=broad-except
+                    concrete_bytes = None
+                if concrete_bytes is not None:
+                    item["bytes_b64"] = base64.b64encode(concrete_bytes).decode("ascii")
             results.append(item)
 
         return {"results": results}
@@ -454,12 +956,25 @@ class AngrMCPServer:
         simgr_id: str,
         simgr: angr.SimulationManager,
         extra_errors: Optional[List[Dict[str, str]]] = None,
+        *,
+        state_callbacks: Optional[Sequence[Callable[[angr.SimState, str], None]]] = None,
     ) -> RunResult:
+        ctx = registry.get_project(project_id)
+        alert_entries: List[Dict[str, Any]] = []
+        callbacks = list(state_callbacks or [])
+        streams: Dict[str, Dict[str, str]] = {}
+
         def register_states(states: Iterable[angr.SimState]) -> List[str]:
             ids = []
             for st in states:
                 state_id = registry.register_state(project_id, st)
                 ids.append(state_id)
+                dump = self._dump_streams(st)
+                if dump:
+                    streams[state_id] = dump
+                alert_entries.extend(self._run_alert_detectors(ctx, project_id, state_id, st))
+                for callback in callbacks:
+                    callback(st, state_id)
             return ids
 
         def stash_states(name: str) -> Iterable[angr.SimState]:
@@ -475,6 +990,14 @@ class AngrMCPServer:
         errored_iter = (err.state for err in stash_states("errored"))
         errored_ids = register_states(errored_iter)
 
+        stashes = {
+            "active": active_ids,
+            "deadended": dead_ids,
+            "found": found_ids,
+            "avoided": avoid_ids,
+            "errored": errored_ids,
+        }
+
         return RunResult(
             simgr_id=simgr_id,
             active=active_ids,
@@ -483,7 +1006,313 @@ class AngrMCPServer:
             avoided=avoid_ids,
             errored=errored_ids,
             errors=extra_errors or [],
+            alerts=alert_entries,
+            stashes=stashes,
+            streams=streams,
         )
+
+    # ------------------------------------------------------------------
+    def _run_alert_detectors(
+        self,
+        ctx: ProjectContext,
+        project_id: str,
+        state_id: str,
+        state: angr.SimState,
+    ) -> List[Dict[str, Any]]:
+        alerts: List[Dict[str, Any]] = []
+        for record in self._detect_unconstrained_ip(ctx, project_id, state_id, state):
+            alerts.append(self._alert_to_dict(record))
+        for record in self._detect_suspicious_writes(ctx, project_id, state_id, state):
+            alerts.append(self._alert_to_dict(record))
+        return alerts
+
+    def _detect_unconstrained_ip(
+        self,
+        ctx: ProjectContext,
+        project_id: str,
+        state_id: str,
+        state: angr.SimState,
+    ) -> List[AlertRecord]:
+        try:
+            symbolic_ip = state.solver.symbolic(state.regs.ip)
+        except Exception:  # pylint:disable=broad-except
+            symbolic_ip = False
+        if not symbolic_ip:
+            return []
+
+        details: Dict[str, Any] = {
+            "solver_cardinality": None,
+            "samples": [],
+            "stack_pointer": None,
+        }
+        try:
+            cardinality = state.solver.cardinality(state.regs.ip)
+            details["solver_cardinality"] = None if cardinality is None else int(cardinality)
+            if cardinality is not None and cardinality <= 4:
+                return []
+        except Exception:  # pylint:disable=broad-except
+            details["solver_cardinality"] = None
+
+        try:
+            details["samples"] = [int(val) for val in state.solver.eval_upto(state.regs.ip, 3)]
+        except Exception:  # pylint:disable=broad-except
+            details["samples"] = []
+
+        try:
+            details["stack_pointer"] = int(state.solver.eval(state.regs.sp))
+        except Exception:  # pylint:disable=broad-except
+            details["stack_pointer"] = None
+
+        try:
+            address_value = int(state.solver.eval(state.regs.ip))
+        except Exception:  # pylint:disable=broad-except
+            address_value = None
+
+        details["constraint_count"] = len(getattr(state.solver, "constraints", []))
+        record = registry.record_alert(
+            project_id,
+            state_id,
+            "unconstrained_ip",
+            address=address_value,
+            details=details,
+        )
+        return [record]
+
+    def _detect_suspicious_writes(
+        self,
+        ctx: ProjectContext,
+        project_id: str,
+        state_id: str,
+        state: angr.SimState,
+    ) -> List[AlertRecord]:
+        alerts: List[AlertRecord] = []
+        recent_actions = []
+        try:
+            recent_actions = list(getattr(state.history, "recent_actions", []) or [])
+        except Exception:  # pylint:disable=broad-except
+            recent_actions = []
+
+        if not recent_actions:
+            recent_actions = list(getattr(state.globals, "get", lambda *_: [])("_mcp_recent_actions", []))
+
+        if not recent_actions:
+            return alerts
+
+        sp_value: Optional[int]
+        try:
+            sp_value = int(state.solver.eval(state.regs.sp))
+        except Exception:  # pylint:disable=broad-except
+            sp_value = None
+
+        sensitive_ranges = self._sensitive_memory_ranges(ctx)
+
+        for action in recent_actions:
+            action_type = getattr(action, "type", None)
+            action_kind = getattr(action, "action", None)
+            if action_type != "mem" or action_kind != "write":
+                continue
+
+            addr_ast = getattr(action, "addr", None)
+            length = getattr(action, "size", None)
+            try:
+                address = int(state.solver.eval(addr_ast)) if addr_ast is not None else None
+            except Exception:  # pylint:disable=broad-except
+                address = None
+
+            if address is None:
+                continue
+
+            stack_hit = False
+            if sp_value is not None:
+                stack_hit = sp_value - 0x40 <= address <= sp_value + 0x100
+
+            segment_hit = None
+            for seg_name, start, end in sensitive_ranges:
+                if start <= address <= end:
+                    segment_hit = seg_name
+                    break
+
+            if not stack_hit and segment_hit is None:
+                continue
+
+            try:
+                length_value = int(state.solver.eval(length)) if length is not None else None
+            except Exception:  # pylint:disable=broad-except
+                length_value = None
+
+            data_ast = getattr(action, "data", None)
+            try:
+                symbolic_data = bool(data_ast is not None and state.solver.symbolic(data_ast))
+            except Exception:  # pylint:disable=broad-except
+                symbolic_data = False
+
+            details = {
+                "stack_hit": stack_hit,
+                "segment": segment_hit,
+                "length": length_value,
+                "symbolic_data": symbolic_data,
+            }
+            alerts.append(
+                registry.record_alert(
+                    project_id,
+                    state_id,
+                    "mem_write",
+                    address=address,
+                    details=details,
+                )
+            )
+
+        return alerts
+
+    def _sensitive_memory_ranges(self, ctx: ProjectContext) -> List[tuple[str, int, int]]:
+        cached = ctx.metadata.get("_mcp_sensitive_ranges")
+        if cached:
+            return list(cached)
+
+        ranges: List[tuple[str, int, int]] = []
+        loader = ctx.project.loader
+        for obj in loader.all_objects:
+            for section in getattr(obj, "sections", []):
+                name = getattr(section, "name", "")
+                if not name:
+                    continue
+                lowered = name.lower()
+                if "got" in lowered or "plt" in lowered:
+                    start = getattr(section, "min_addr", None)
+                    end = getattr(section, "max_addr", None)
+                    if start is not None and end is not None:
+                        ranges.append((name, int(start), int(end)))
+        ctx.metadata["_mcp_sensitive_ranges"] = list(ranges)
+        return ranges
+
+    @staticmethod
+    def _alert_to_dict(alert: AlertRecord) -> Dict[str, Any]:
+        data: Dict[str, Any] = {
+            "alert_id": alert.alert_id,
+            "state_id": alert.state_id,
+            "type": alert.type,
+            "timestamp": alert.timestamp,
+        }
+        if alert.address is not None:
+            data["address"] = alert.address
+        if alert.details:
+            data["details"] = alert.details
+        return data
+
+    # ------------------------------------------------------------------
+    def _persist_job(
+        self,
+        project_id: str,
+        job_ctx: JobContext,
+        stash_map: Dict[str, List[str]],
+    ) -> None:
+        storage_dir = self._job_storage_dir()
+        storage_dir.mkdir(exist_ok=True)
+        path = storage_dir / f"{job_ctx.job_id}.json"
+
+        state_blobs: Dict[str, str] = {}
+        for state_id in sorted({sid for sids in stash_map.values() for sid in sids}):
+            try:
+                state = registry.get_state(project_id, state_id)
+            except KeyError:
+                continue
+            try:
+                blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+                state_blobs[state_id] = base64.b64encode(blob).decode("ascii")
+            except Exception:  # pylint:disable=broad-except
+                continue
+
+        ctx = registry.get_project(project_id)
+        job_ctx.metadata.setdefault("persisted", True)
+
+        payload = {
+            "job_id": job_ctx.job_id,
+            "project_id": project_id,
+            "created_at": job_ctx.created_at,
+            "updated_at": job_ctx.updated_at,
+            "metadata": job_ctx.metadata,
+            "stashes": stash_map,
+            "states": state_blobs,
+            "project": ctx.metadata,
+            "persisted_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "format": "angr-mcp-job-v1",
+        }
+
+        with path.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2)
+
+        registry.update_job(project_id, job_ctx.job_id, backing_path=str(path))
+
+    def _load_job_from_disk(self, project_id: str, job_id: str) -> JobContext:
+        path = self._job_storage_dir() / f"{job_id}.json"
+        if not path.exists():
+            raise KeyError(f"persisted job {job_id} not found on disk")
+
+        with path.open("r", encoding="utf-8") as fp:
+            payload = json.load(fp)
+
+        stash_map: Dict[str, List[str]] = {
+            k: list(v) for k, v in (payload.get("stashes") or {}).items()
+        }
+        state_records: Dict[str, angr.SimState] = {}
+        ctx = registry.get_project(project_id)
+        for state_id, encoded in (payload.get("states") or {}).items():
+            try:
+                state = pickle.loads(base64.b64decode(encoded))
+                state.project = ctx.project
+                state_records[state_id] = state
+                registry.register_state(project_id, state, state_id=state_id)
+            except Exception:  # pylint:disable=broad-except
+                continue
+
+        active_states = [state_records[sid] for sid in stash_map.get("active", []) if sid in state_records]
+        simgr = angr.SimulationManager(ctx.project, active_states=active_states)
+        for stash_name, ids in stash_map.items():
+            if stash_name == "active":
+                continue
+            states = [state_records[sid] for sid in ids if sid in state_records]
+            if not states:
+                continue
+            simgr._store_states(stash_name, states)
+
+        simgr_id = registry.register_simmanager(project_id, simgr)
+        job_ctx = registry.register_job(
+            project_id,
+            simgr_id,
+            state_ids=list(state_records.keys()),
+            metadata=payload.get("metadata", {}),
+            job_id=job_id,
+            backing_path=str(path),
+        )
+        job_ctx.created_at = payload.get("created_at", job_ctx.created_at)
+        job_ctx.updated_at = payload.get("updated_at", job_ctx.updated_at)
+        job_ctx.metadata.setdefault("persisted", True)
+        job_ctx.metadata.setdefault("stashes", stash_map)
+        return job_ctx
+
+    @staticmethod
+    def _job_storage_dir() -> pathlib.Path:
+        return pathlib.Path(".mcp_jobs")
+
+    @staticmethod
+    def _job_to_dict(job: JobContext) -> Dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "simgr_id": job.simgr_id,
+            "project_id": job.project_id,
+            "state_ids": list(job.state_ids),
+            "metadata": job.metadata,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "backing_path": job.backing_path,
+        }
+
+    @staticmethod
+    def _find_job_by_simgr(project_id: str, simgr_id: str) -> Optional[JobContext]:
+        for job in registry.list_jobs(project_id).values():
+            if job.simgr_id == simgr_id:
+                return job
+        return None
 
     # ------------------------------------------------------------------
     def _resolve_simprocedure(self, dotted_name: str):

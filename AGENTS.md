@@ -10,9 +10,13 @@ for future human or agent contributors working on the angr MCP server project.
   artifacts locally.
 - **Dependencies**: install `claripy` and `angr` from PyPI inside the virtual
   environment (`uv pip install --python .venv/bin/python claripy angr`).
-- **Testing**: run `.venv/bin/python -m unittest tests.test_mcp_server`.
-- **Binary samples**: tests compile a tiny C program on the fly; a working C
-  compiler (`cc` or `gcc`) must be available.
+- **Testing**: run `.venv/bin/python -m unittest discover tests` to cover both
+  the synthetic sample binary suite and the angr CTF Phase 1 regressions.
+- **Binary samples**: Phase 1 tests rely on bundled 32-bit angr CTF binaries.
+  Native replay assertions will skip automatically if `/lib/ld-linux.so.2`
+  (or equivalent) is unavailable. The legacy sample binary still compiles on
+  the fly and therefore continues to require a working C compiler (`cc` or
+  `gcc`).
 
 ## Repository Layout Snapshot
 
@@ -28,8 +32,13 @@ for future human or agent contributors working on the angr MCP server project.
     strategies.
   - `resources/GhidraMCP` – Shared assets for coordinating workflows with the
     Ghidra MCP server.
-- `tests/test_mcp_server.py` – Integration tests; doubles as executable
-  examples for the handler workflow.
+- `angr_mcp/utils/` – Shared binary-inspection and state-mutation helpers used
+  by handlers and tests.
+- `tests/test_mcp_server.py` – Integration tests; doubles as executable examples
+  for the handler workflow.
+- `tests/test_phase1_ctf.py` – Automates angr CTF levels 00–04 through MCP
+  handlers, asserting predicate metadata, register/stack tooling, and native
+  replay.
 - `pyproject.toml` – Minimal configuration for `uv` environment management.
 
 ## Implemented Workflow (Session Summary)
@@ -56,6 +65,16 @@ for future human or agent contributors working on the angr MCP server project.
    constraint solving, monitoring, alerts, job persistence, CFG, and slicing.
 8. Provisioned a `uv`-managed virtual environment and documented setup in the
    README.
+9. Implemented predicate descriptors (`address`, `stdout_contains`,
+   `stdout_not_contains`) with recorded match metadata and stream capture in
+   `run_symbolic_search`.
+10. Added structured state-mutation helpers (register injection, stack
+    adjustments, solver-option presets) plus the public `mutate_state` handler
+    and symbolic handle tracking for constraint queries.
+11. Created binary-analysis utilities (`angr_mcp/utils`) powering `.rodata`
+    scans and literal cross-referencing used by Phase 1 automation.
+12. Authored Phase 1 angr CTF regression tests validating levels 00–04 via the
+    MCP tooling and confirming native execution of recovered inputs.
 
 ## Collaboration Rules
 

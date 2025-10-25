@@ -20,10 +20,16 @@ found.
   constraint solving, CFG recovery, and backward slicing. It also integrates
   community exploration techniques shipped in
   `awesome-angr/ExplorationTechniques`.
+- `angr_mcp/utils/` – Binary-inspection and state-mutation helpers shared by
+  the MCP handlers and tests (section scanners, literal cross-referencing,
+  register/stack mutation primitives, and symbolic-handle registration).
 - `tests/test_mcp_server.py` – Integration tests that compile a small C binary
   and exercise the server end-to-end (load project, set symbolic stdin, run a
   targeted search, solve constraints, capture monitored events, and perform
   CFG/slice queries).
+- `tests/test_phase1_ctf.py` – Phase 1 regression suite recreating angr CTF
+  levels 00–04 exclusively through MCP handlers, asserting predicate metadata,
+  register/stack mutation APIs, and native replay of recovered inputs.
 - `pyproject.toml` – Minimal configuration enabling `uv` to manage a local
   virtual environment.
 - `schemas/` – JSON Schema Draft 2020-12 definitions for every MCP handler
@@ -48,8 +54,12 @@ found.
 3. Run the integration tests:
 
    ```bash
-   .venv/bin/python -m unittest tests.test_mcp_server
+   .venv/bin/python -m unittest discover tests
    ```
+
+   The Phase 1 tests exercise 32-bit angr CTF binaries. If your host lacks
+   32-bit runtime libraries (`/lib/ld-linux.so.2`), the suite will skip the
+   native replay assertions automatically.
 
 ## Usage Overview
 
@@ -85,6 +95,14 @@ MCP transport:
 - Structured alerting now highlights unconstrained instruction-pointer states
   and suspicious memory writes, returning normalized JSON objects alongside run
   results and state inspection payloads.
+- `setup_symbolic_context` and the new `mutate_state` handler support option
+  presets, register copying/injection, stack adjustments, and symbolic handle
+  tracking for later constraint solving.
+- Predicate descriptors (`address`, `stdout_contains`, `stdout_not_contains`)
+  now drive `run_symbolic_search`, and predicate matches are recorded in the
+  run payload alongside base64-encoded stdin/stdout streams.
+- Helper utilities in `angr_mcp/utils/` expose section scanners and literal
+  cross-references used to automate angr CTF level analysis.
 - Jobs created via `run_symbolic_search` can be resumed, enumerated, and
   persisted to `.mcp_jobs/<job_id>.json`; persisted jobs can be rehydrated
   across processes through `resume_job`.
@@ -95,7 +113,22 @@ MCP transport:
 - Symbolic stdin setup initializes the default `SimPacketsStream` content
   in-place to avoid compat issues with angr’s POSIX plugin.
 - Integration tests validate the exploit-oriented workflow end to end (requires
-  installing `claripy` and `angr` via `uv pip`).
+  installing `claripy` and `angr` via `uv pip`). Supplementary Phase 1 CTF
+  tests assert deterministic solutions for levels 00–04 in
+  `tests/test_phase1_ctf.py`.
+
+## Phase 1 angr_ctf Coverage Highlights
+
+- Level 00/01: `.rodata` token extraction and literal cross-referencing feed
+  predicate descriptors that prove the concrete solution and ensure avoid sites
+  remain untouched.
+- Level 02: Pure stdout-based predicates demonstrate predicate logging,
+  metadata persistence, and streamed stdout capture for repro.
+- Level 03: Blank-state creation, symbolic register injection, and solver
+  handle queries recover integer tuples that replay natively.
+- Level 04: Stack alignment helpers and symbolic push operations mirror the
+  native stack frame without triggering alert detectors, validating stack
+  integrity through the handler pipeline.
 
 ## Planned Next Steps
 
