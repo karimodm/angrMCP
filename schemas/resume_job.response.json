@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "resume_job response",
+  "type": "object",
+  "required": ["job", "simgr_id"],
+  "properties": {
+    "job": {"$ref": "common.json#/$defs/job-summary"},
+    "simgr_id": {"$ref": "common.json#/$defs/uuid"}
+  }
+}

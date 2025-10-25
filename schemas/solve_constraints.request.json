@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "solve_constraints request",
+  "type": "object",
+  "required": ["project_id", "state_id", "queries"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"$ref": "common.json#/$defs/uuid"},
+    "state_id": {"$ref": "common.json#/$defs/uuid"},
+    "queries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["memory", "register"]
+          },
+          "address": {"$ref": "common.json#/$defs/hex-address"},
+          "size": {"type": "integer", "minimum": 1},
+          "name": {"type": "string"},
+          "minmax": {"type": "boolean", "default": false}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"kind": {"const": "memory"}}},
+            "then": {"required": ["address", "size"]}
+          },
+          {
+            "if": {"properties": {"kind": {"const": "register"}}},
+            "then": {"required": ["name"]}
+          }
+        ]
+      }
+    }
+  }
+}

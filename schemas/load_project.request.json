@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "load_project request",
+  "type": "object",
+  "required": ["binary_path"],
+  "additionalProperties": false,
+  "properties": {
+    "binary_path": {
+      "type": "string",
+      "description": "Filesystem path to the binary to analyze."
+    },
+    "auto_load_libs": {
+      "type": "boolean",
+      "default": true
+    },
+    "load_options": {
+      "type": "object",
+      "description": "Optional angr loader keyword arguments."
+    },
+    "exclude_sim_procedures_list": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "exclude_sim_procedures_func": {
+      "type": "string",
+      "description": "Symbol name for the exclusion function."
+    },
+    "use_sim_procedures": {
+      "type": "boolean",
+      "default": true
+    }
+  }
+}

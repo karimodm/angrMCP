@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "load_project response",
+  "type": "object",
+  "required": ["project_id", "metadata"],
+  "properties": {
+    "project_id": {"$ref": "common.json#/$defs/uuid"},
+    "metadata": {
+      "type": "object",
+      "description": "Loader metadata describing the binary and loaded objects."
+    }
+  }
+}

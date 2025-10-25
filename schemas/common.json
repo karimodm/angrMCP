@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://angr-mcp.local/schemas/common.json",
+  "title": "angr MCP Common Definitions",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+      "description": "Canonical UUID string representation."
+    },
+    "hex-address": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Absolute virtual address, represented as an integer."
+    },
+    "error-record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "message"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "Python exception type captured during execution."
+        },
+        "message": {
+          "type": "string",
+          "description": "Stringified exception message."
+        }
+      }
+    },
+    "alert": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alert_id", "state_id", "type", "timestamp"],
+      "properties": {
+        "alert_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "state_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["unconstrained_ip", "mem_write"],
+          "description": "Alert category."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "address": {
+          "$ref": "#/$defs/hex-address"
+        },
+        "details": {
+          "type": "object",
+          "description": "Alert-specific metadata."
+        }
+      }
+    },
+    "job-summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "simgr_id", "project_id", "state_ids", "metadata"],
+      "properties": {
+        "job_id": {"$ref": "#/$defs/uuid"},
+        "simgr_id": {"$ref": "#/$defs/uuid"},
+        "project_id": {"$ref": "#/$defs/uuid"},
+        "state_ids": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "metadata": {
+          "type": "object"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "backing_path": {
+          "type": "string",
+          "description": "Filesystem path for persisted job data."
+        }
+      }
+    }
+  }
+}

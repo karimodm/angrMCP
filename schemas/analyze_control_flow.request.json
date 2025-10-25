@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "analyze_control_flow request",
+  "type": "object",
+  "required": ["project_id"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"$ref": "common.json#/$defs/uuid"},
+    "force_fast": {"type": "boolean", "default": false},
+    "keep_state": {"type": "boolean", "default": false}
+  }
+}

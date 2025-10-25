@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "delete_job request",
+  "type": "object",
+  "required": ["project_id", "job_id"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"$ref": "common.json#/$defs/uuid"},
+    "job_id": {"$ref": "common.json#/$defs/uuid"},
+    "remove_disk": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}

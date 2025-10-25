@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "setup_symbolic_context response",
+  "type": "object",
+  "required": ["state_id", "registers"],
+  "additionalProperties": false,
+  "properties": {
+    "state_id": {"$ref": "common.json#/$defs/uuid"},
+    "registers": {
+      "type": "object",
+      "description": "Snapshot of key registers after state creation.",
+      "properties": {
+        "ip": {"$ref": "common.json#/$defs/hex-address"},
+        "sp": {"$ref": "common.json#/$defs/hex-address"},
+        "bp": {"$ref": "common.json#/$defs/hex-address"}
+      },
+      "additionalProperties": true
+    }
+  }
+}

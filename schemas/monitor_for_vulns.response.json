@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "monitor_for_vulns response",
+  "type": "object",
+  "required": ["monitored_events"],
+  "properties": {
+    "monitored_events": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "setup_symbolic_context request",
+  "type": "object",
+  "required": ["project_id"],
+  "additionalProperties": false,
+  "properties": {
+    "project_id": {"$ref": "common.json#/$defs/uuid"},
+    "kind": {
+      "type": "string",
+      "enum": ["entry", "full_init", "blank", "call"],
+      "default": "entry"
+    },
+    "addr": {"$ref": "common.json#/$defs/hex-address"},
+    "args": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "argv": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    },
+    "stdin_symbolic": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "symbolic_memory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["address", "size"],
+        "properties": {
+          "address": {"$ref": "common.json#/$defs/hex-address"},
+          "size": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "symbolic_registers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "size"],
+        "properties": {
+          "name": {"type": "string"},
+          "size": {"type": "integer", "minimum": 1}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "call"}}},
+      "then": {"required": ["addr"]}
+    }
+  ]
+}
