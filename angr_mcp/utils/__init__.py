@@ -2,8 +2,10 @@
 
 from .binary import (
     extract_uppercase_tokens,
+    find_call_to_symbol,
     find_literal_addresses,
     find_string_reference_addresses,
+    read_c_string,
     read_section_bytes,
 )
 from .state import (
@@ -17,8 +19,10 @@ from .state import (
 
 __all__ = [
     "extract_uppercase_tokens",
+    "find_call_to_symbol",
     "find_literal_addresses",
     "find_string_reference_addresses",
+    "read_c_string",
     "read_section_bytes",
     "mutate_registers",
     "mutate_stack",

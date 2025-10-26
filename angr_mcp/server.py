@@ -10,13 +10,14 @@ import pathlib
 import pickle
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import angr
 import claripy
 
 import angr.exploration_techniques
+from angr.storage.file import SimFile
 
 from .registry import AlertRecord, HookDescriptor, JobContext, ProjectContext, registry
 from .utils import (
@@ -273,6 +274,59 @@ class AngrMCPServer:
         return entries
 
     @staticmethod
+    def _seed_filesystem(state: angr.SimState, specs: Optional[Iterable[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for spec in specs or []:
+            path = spec["path"]
+            symbolic_spec = spec.get("symbolic")
+            content = spec.get("content")
+
+            if symbolic_spec is not None:
+                if symbolic_spec is False:
+                    symbolic_spec = {}
+                elif symbolic_spec is True:
+                    symbolic_spec = {}
+
+                size = spec.get("size") or symbolic_spec.get("size")
+                bits = symbolic_spec.get("bits")
+                if size is None and bits is None:
+                    raise ValueError("symbolic file entry requires either size or bits")
+                if bits is None and size is not None:
+                    bits = int(size) * 8
+                if size is None and bits is not None:
+                    if int(bits) % 8 != 0:
+                        raise ValueError("symbolic file bit-width must be byte aligned")
+                    size = int(bits) // 8
+                size = int(size)
+                bits = int(bits)
+                if size <= 0 or bits <= 0:
+                    raise ValueError("symbolic file entry requires positive size")
+                label = symbolic_spec.get("label", path)
+                symbol, metadata = new_symbolic_bitvector(state, label, bits, handle_prefix="file")
+                simfile = SimFile(path, content=symbol, size=size)
+                state.fs.insert(path, simfile)
+                entry = {"path": path, "size": size}
+                entry.update(metadata)
+                entries.append(entry)
+                continue
+
+            if content is not None:
+                if isinstance(content, str):
+                    data = content.encode("utf-8")
+                elif isinstance(content, bytes):
+                    data = content
+                else:
+                    raise TypeError("filesystem content must be bytes or str")
+                simfile = SimFile(path, content=data)
+                state.fs.insert(path, simfile)
+                entries.append({"path": path, "size": len(data), "content_b64": base64.b64encode(data).decode("ascii")})
+                continue
+
+            raise ValueError(f"unsupported filesystem specification: {spec!r}")
+
+        return entries
+
+    @staticmethod
     def _dump_streams(state: angr.SimState) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
         for fd, name in ((0, "stdin"), (1, "stdout"), (2, "stderr")):
@@ -291,6 +345,68 @@ class AngrMCPServer:
         if handle not in store:
             raise KeyError(f"unknown symbolic handle: {handle}")
         return store[handle]
+
+    @staticmethod
+    def _coerce_constraint_value(state: angr.SimState, value: Any, expected_bits: int) -> claripy.ast.BV:
+        raw = value
+        if isinstance(value, dict):
+            if "handle" in value:
+                handle = value["handle"]
+                return AngrMCPServer._resolve_symbol_handle(state, handle)
+            if "bytes_b64" in value:
+                raw = base64.b64decode(value["bytes_b64"])
+            elif "bytes" in value:
+                raw = value["bytes"]
+            elif "string" in value:
+                raw = value["string"]
+            elif "value" in value:
+                raw = int(value["value"])
+            else:
+                raise ValueError(f"unsupported constraint value spec: {value!r}")
+
+        if isinstance(raw, claripy.ast.Base):
+            bv = raw
+        elif isinstance(raw, bytes):
+            bv = claripy.BVV(raw)
+        elif isinstance(raw, str):
+            bv = claripy.BVV(raw.encode("utf-8"))
+        elif isinstance(raw, int):
+            bits = expected_bits or max(raw.bit_length(), 1)
+            bv = claripy.BVV(raw, bits)
+        else:
+            raise TypeError(f"unsupported constraint value type: {type(raw)!r}")
+
+        if expected_bits and bv.size() != expected_bits:
+            if bv.size() > expected_bits:
+                raise ValueError("constraint value width larger than target width")
+            extension = expected_bits - bv.size()
+            bv = claripy.ZeroExt(extension, bv)
+
+        return bv
+
+    @staticmethod
+    def _serialize_global_value(value: Any) -> Any:
+        if isinstance(value, (type(None), int, float, str, bool)):
+            return value
+        if isinstance(value, bytes):
+            return {
+                "type": "bytes",
+                "value_b64": base64.b64encode(value).decode("ascii"),
+            }
+        if isinstance(value, claripy.ast.Base):
+            return {
+                "type": "claripy_ast",
+                "bits": value.size(),
+                "repr": repr(value),
+            }
+        if isinstance(value, list):
+            return [AngrMCPServer._serialize_global_value(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: AngrMCPServer._serialize_global_value(val)
+                for key, val in value.items()
+            }
+        return repr(value)
 
     # ------------------------------------------------------------------
     def load_project(
@@ -333,6 +449,7 @@ class AngrMCPServer:
         symbolic_memory: Optional[List[Dict[str, Any]]] = None,
         symbolic_registers: Optional[List[Dict[str, Any]]] = None,
         stack_mutations: Optional[List[Dict[str, Any]]] = None,
+        filesystem: Optional[List[Dict[str, Any]]] = None,
         add_options: Optional[Iterable[Any]] = None,
         remove_options: Optional[Iterable[Any]] = None,
     ) -> Dict[str, Any]:
@@ -392,6 +509,7 @@ class AngrMCPServer:
             )
 
         mem_entries = self._apply_symbolic_memory(state, symbolic_memory)
+        file_entries = self._seed_filesystem(state, filesystem)
 
         if symbolic_registers:
             mutate_registers(state, symbolic_registers, result=mutation_summary)
@@ -421,6 +539,8 @@ class AngrMCPServer:
             symbolic_payload["stack"] = stack_symbols
         if mem_entries:
             symbolic_payload["memory"] = mem_entries
+        if file_entries:
+            symbolic_payload["filesystem"] = file_entries
 
         response = {
             "state_id": state_id,
@@ -451,15 +571,17 @@ class AngrMCPServer:
             length = hook_spec.get("length")
 
             description = ""
-            if hook_spec.get("simprocedure"):
-                simproc = self._resolve_simprocedure(hook_spec["simprocedure"])
-                proc_instance = simproc()
+            sim_spec = hook_spec.get("simprocedure") or hook_spec.get("simprocedure_class")
+            if sim_spec is not None:
+                proc_instance, description = self._instantiate_simprocedure(
+                    sim_spec,
+                    args=hook_spec.get("simprocedure_args"),
+                    kwargs=hook_spec.get("simprocedure_kwargs"),
+                )
                 if address is not None:
                     project.hook(address, proc_instance)
-                    description = f"simprocedure:{hook_spec['simprocedure']}"
                 elif symbol is not None:
                     project.hook_symbol(symbol, proc_instance)
-                    description = f"simprocedure:{hook_spec['simprocedure']}"
                 else:
                     raise ValueError("hook requires address or symbol")
             elif hook_spec.get("python_callable"):
@@ -562,6 +684,59 @@ class AngrMCPServer:
             response["symbolic"] = symbolic_payload
 
         return response
+
+    # ------------------------------------------------------------------
+    def add_constraints(
+        self,
+        project_id: str,
+        state_id: str,
+        constraints: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        state = registry.get_state(project_id, state_id)
+        applied: List[Dict[str, Any]] = []
+
+        for spec in constraints:
+            kind = spec.get("kind")
+            if kind is None:
+                raise ValueError("constraint specification missing 'kind'")
+
+            if kind == "expression":
+                expr = spec.get("expression")
+                if expr is None:
+                    raise ValueError("expression constraint requires 'expression'")
+                state.add_constraints(expr)
+                applied.append({"kind": kind})
+                continue
+
+            target_ast: claripy.ast.Base
+            descriptor: Dict[str, Any] = {"kind": kind}
+
+            if kind == "symbol":
+                handle = spec["handle"]
+                target_ast = self._resolve_symbol_handle(state, handle)
+                descriptor["handle"] = handle
+            elif kind == "memory":
+                address = int(spec["address"])
+                size = int(spec["size"])
+                target_ast = state.memory.load(address, size)
+                descriptor.update({"address": address, "size": size})
+            elif kind == "register":
+                reg_name = spec["name"]
+                target_ast = getattr(state.regs, reg_name)
+                descriptor["name"] = reg_name
+            else:
+                raise ValueError(f"unsupported constraint target kind: {kind!r}")
+
+            equals = spec.get("equals")
+            if equals is None:
+                raise ValueError(f"constraint kind {kind!r} requires 'equals'")
+
+            value_ast = self._coerce_constraint_value(state, equals, target_ast.size())
+            constraint = target_ast == value_ast
+            state.add_constraints(constraint)
+            applied.append(descriptor)
+
+        return {"applied": applied, "count": len(applied)}
 
     # ------------------------------------------------------------------
     def run_symbolic_search(
@@ -676,7 +851,7 @@ class AngrMCPServer:
                 "find": find_serialized,
                 "avoid": avoid_serialized,
                 "techniques": list(techniques or []),
-                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
                 "alerts": result.alerts,
                 "errors": result.errors,
             },
@@ -787,6 +962,8 @@ class AngrMCPServer:
         include_constraints: bool = False,
         include_events: bool = False,
         include_alerts: bool = False,
+        include_globals: bool = False,
+        globals_keys: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         state = registry.get_state(project_id, state_id)
         data: Dict[str, Any] = {}
@@ -828,6 +1005,24 @@ class AngrMCPServer:
             if include_alerts:
                 alerts = monitor.alerts if monitor else []
                 data["alerts"] = [self._alert_to_dict(alert) for alert in alerts]
+
+        if include_globals:
+            keys = list(globals_keys or state.globals.keys())
+            globals_payload: Dict[str, Any] = {}
+            for key in keys:
+                if key not in state.globals:
+                    continue
+                value = state.globals[key]
+                if key == SYMBOL_STORE_KEY:
+                    store = state.globals.get(SYMBOL_STORE_KEY, {})
+                    globals_payload[key] = [
+                        {"handle": handle, "bits": ast.size()}
+                        for handle, ast in store.items()
+                    ]
+                    continue
+                globals_payload[key] = self._serialize_global_value(value)
+            if globals_payload:
+                data["globals"] = globals_payload
 
         return data
 
@@ -1234,7 +1429,7 @@ class AngrMCPServer:
             "stashes": stash_map,
             "states": state_blobs,
             "project": ctx.metadata,
-            "persisted_at": datetime.utcnow().isoformat(timespec="seconds"),
+            "persisted_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "format": "angr-mcp-job-v1",
         }
 
@@ -1326,11 +1521,44 @@ class AngrMCPServer:
             raise KeyError(f"unknown simprocedure: {dotted_name}")
         return angr.SIM_PROCEDURES[lib][name]
 
+    def _instantiate_simprocedure(
+        self,
+        spec: Any,
+        *,
+        args: Optional[Iterable[Any]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[angr.SimProcedure, str]:
+        args_list = list(args or [])
+        kwargs_dict = dict(kwargs or {})
+
+        if isinstance(spec, str):
+            sim_cls = self._resolve_simprocedure(spec)
+            instance = sim_cls(*args_list, **kwargs_dict)
+            return instance, f"simprocedure:{spec}"
+
+        if isinstance(spec, type) and issubclass(spec, angr.SimProcedure):
+            instance = spec(*args_list, **kwargs_dict)
+            return instance, f"simprocedure:{spec.__name__}"
+
+        if isinstance(spec, angr.SimProcedure):
+            return spec, f"simprocedure:{spec.display_name or type(spec).__name__}"
+
+        raise TypeError(f"unsupported simprocedure specification: {spec!r}")
+
     def _load_technique(self, name: str, project: angr.Project):
         name = name.lower()
         if name in self._technique_cache:
             factory = self._technique_cache[name]
             return factory()
+
+        if name == "veritesting":
+            try:
+                from angr.exploration_techniques.veritesting import Veritesting
+            except ImportError as exc:  # pylint:disable=broad-except
+                raise ImportError("veritesting technique unavailable") from exc
+
+            self._technique_cache[name] = Veritesting
+            return Veritesting()
 
         base_path = pathlib.Path("awesome-angr/ExplorationTechniques")
         mapping = {

@@ -150,3 +150,68 @@ def find_string_reference_addresses(
 def _build_cfg(project: angr.Project) -> angr.analyses.analysis.Analysis:
     """Construct and memoise a fast CFG for literal search helpers."""
     return project.analyses.CFGFast()
+
+
+def read_c_string(project: angr.Project, address: int, *, max_bytes: int = 256) -> bytes:
+    """Read a null-terminated C string from project memory."""
+
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    raw = project.loader.memory.load(address, max_bytes)
+    if isinstance(raw, bytes):
+        data = raw
+    elif isinstance(raw, bytearray):
+        data = bytes(raw)
+    else:
+        data = bytes(raw)
+
+    terminator = data.find(b"\x00")
+    if terminator != -1:
+        data = data[:terminator]
+    return data
+
+
+def find_call_to_symbol(
+    project: angr.Project,
+    caller_symbol: str,
+    callee_symbol: str,
+    *,
+    occurrence: int = 0,
+) -> Tuple[int, int]:
+    """Return the address and size of the call instruction to a callee within a caller."""
+
+    caller = project.loader.find_symbol(caller_symbol)
+    callee = project.loader.find_symbol(callee_symbol)
+    if caller is None:
+        raise ValueError(f"caller symbol {caller_symbol!r} not found")
+    if callee is None:
+        raise ValueError(f"callee symbol {callee_symbol!r} not found")
+
+    caller_addr = caller.rebased_addr
+    callee_addr = callee.rebased_addr
+
+    func = project.kb.functions.function(caller_addr)
+    if func is None:
+        raise ValueError(f"function for {caller_symbol!r} not recovered")
+
+    count = 0
+    for block in sorted(func.blocks, key=lambda b: b.addr):
+        capstone_block = getattr(block, "capstone", None)
+        if capstone_block is None:
+            continue
+        for insn in capstone_block.insns:
+            if insn.mnemonic.lower().startswith("call"):
+                operands = getattr(insn, "operands", [])
+                for operand in operands:
+                    if getattr(operand, "type", None) != CS_OP_IMM:
+                        continue
+                    if int(getattr(operand, "imm", 0)) != callee_addr:
+                        continue
+                    if count == occurrence:
+                        return insn.address, insn.size
+                    count += 1
+
+    raise ValueError(
+        f"call to {callee_symbol!r} from {caller_symbol!r} (occurrence {occurrence}) not found",
+    )

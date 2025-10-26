@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any, Dict, Iterable, List, Optional
 
 import angr
@@ -134,7 +134,7 @@ class Registry:
         alert_id: Optional[str] = None,
     ) -> AlertRecord:
         monitor = self.ensure_monitor(project_id, state_id)
-        ts = timestamp or datetime.utcnow().isoformat(timespec="seconds")
+        ts = timestamp or datetime.now(UTC).isoformat(timespec="seconds")
         record = AlertRecord(
             alert_id=alert_id or str(uuid.uuid4()),
             state_id=state_id,
@@ -181,7 +181,7 @@ class Registry:
     ) -> JobContext:
         ctx = self.get_project(project_id)
         job_identifier = job_id or str(uuid.uuid4())
-        timestamp = datetime.utcnow().isoformat(timespec="seconds")
+        timestamp = datetime.now(UTC).isoformat(timespec="seconds")
         job = JobContext(
             job_id=job_identifier,
             project_id=project_id,
@@ -217,7 +217,7 @@ class Registry:
             job.metadata.update(metadata)
         if backing_path is not None:
             job.backing_path = backing_path
-        job.updated_at = datetime.utcnow().isoformat(timespec="seconds")
+        job.updated_at = datetime.now(UTC).isoformat(timespec="seconds")
         return job
 
     def delete_job(self, project_id: str, job_id: str) -> None:
