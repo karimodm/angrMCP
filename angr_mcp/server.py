@@ -493,12 +493,8 @@ class AngrMCPServer:
                 handle_prefix="stdin",
             )
             stdin_stream = state.posix.stdin
-            unit = claripy.BVV(1, state.arch.bits)
-            packets = [
-                (sym_stdin.get_bytes(index, 1), unit)
-                for index in range(stdin_symbolic)
-            ]
-            stdin_stream.content = packets
+            size_bv = claripy.BVV(stdin_symbolic, state.arch.bits)
+            stdin_stream.content = [(sym_stdin, size_bv)]
             stdin_stream.pos = 0
             stdin_stream.write_mode = False
             stdin_entry = {
