@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import importlib
 import importlib.util
 import json
@@ -22,6 +23,8 @@ from angr.storage.file import SimFile
 from .registry import AlertRecord, HookDescriptor, JobContext, ProjectContext, registry
 from .utils import (
     SYMBOL_STORE_KEY,
+    StateBudgetExceeded,
+    StateBudgetLimiter,
     StateMutationResult,
     mutate_registers,
     mutate_stack,
@@ -43,6 +46,7 @@ class RunResult:
     stashes: Optional[Dict[str, List[str]]] = None
     streams: Dict[str, Dict[str, str]] = field(default_factory=dict)
     predicate_matches: List[Dict[str, Any]] = field(default_factory=list)
+    state_pressure: Optional[Dict[str, Any]] = None
 
 
 class PredicateEngine:
@@ -751,6 +755,8 @@ class AngrMCPServer:
         avoid: Optional[List[int]] = None,
         step_count: int = 1,
         techniques: Optional[List[str]] = None,
+        state_budget: Optional[int] = None,
+        budget_stashes: Optional[Sequence[str]] = None,
         persist_job: bool = False,
         job_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -794,6 +800,14 @@ class AngrMCPServer:
                     metadata={"note": "job initialized from fresh state"},
                 )
 
+        state_pressure: Optional[Dict[str, Any]] = None
+        budget_limiter: Optional[StateBudgetLimiter] = None
+        budget_error: Optional[StateBudgetExceeded] = None
+
+        if state_budget is not None:
+            budget_limiter = StateBudgetLimiter(state_budget, stashes=budget_stashes)
+            simgr.use_technique(budget_limiter)
+
         for tech_name in techniques or []:
             technique = self._load_technique(tech_name, project)
             if technique is not None:
@@ -818,8 +832,32 @@ class AngrMCPServer:
                 simgr.explore(**explore_kwargs)
             else:
                 raise ValueError(f"unknown mode: {mode}")
+        except StateBudgetExceeded as exc:
+            budget_error = exc
+            caught_errors.append(
+                {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
         except Exception as exc:  # pylint:disable=broad-except
             caught_errors.append({"type": type(exc).__name__, "message": str(exc)})
+
+        if budget_limiter is not None or budget_error is not None:
+            if budget_error is not None:
+                counts = dict(budget_error.stash_counts)
+                total = budget_error.total
+                status = "exceeded"
+            else:
+                counts = dict(budget_limiter.last_counts)
+                total = sum(counts.values())
+                status = "ok"
+            state_pressure = {
+                "status": status,
+                "budget": state_budget,
+                "total": total,
+                "stashes": counts,
+            }
 
         result = self._collect_run_result(
             project_id,
@@ -827,6 +865,7 @@ class AngrMCPServer:
             simgr,
             extra_errors=caught_errors,
             state_callbacks=state_callbacks,
+            state_pressure=state_pressure,
         )
         predicate_matches: List[Dict[str, Any]] = []
         if find_engine.has_predicates():
@@ -862,6 +901,9 @@ class AngrMCPServer:
                 "matches": predicate_matches,
             },
         }
+        if state_pressure:
+            metadata_payload["last_run"]["state_pressure"] = state_pressure
+            metadata_payload["state_pressure"] = state_pressure
         if job_metadata:
             metadata_payload.update(job_metadata)
 
@@ -1103,6 +1145,118 @@ class AngrMCPServer:
         }
 
     # ------------------------------------------------------------------
+    def analyze_call_chain(
+        self,
+        project_id: str,
+        *,
+        source: Any,
+        target: Any,
+        max_paths: int = 10,
+        max_depth: Optional[int] = None,
+        use_fast: bool = False,
+        keep_state: bool = True,
+    ) -> Dict[str, Any]:
+        import networkx as nx  # type: ignore
+
+        ctx = registry.get_project(project_id)
+        project = ctx.project
+        if max_paths <= 0:
+            raise ValueError("max_paths must be positive")
+        if max_depth is not None and max_depth <= 0:
+            raise ValueError("max_depth must be positive when provided")
+        cfg_key = "CFGFast" if use_fast else "CFGEmulated"
+        cfg = ctx.cfg_cache.get(cfg_key)
+        if cfg is None:
+            if use_fast:
+                cfg = project.analyses.CFGFast()
+            else:
+                cfg = project.analyses.CFGEmulated(keep_state=keep_state)
+            ctx.cfg_cache[cfg_key] = cfg
+
+        callgraph = cfg.kb.callgraph
+        if callgraph is None:
+            raise RuntimeError("call graph unavailable; run analyze_control_flow first")
+
+        def resolve(identifier: Any) -> Tuple[int, Any]:
+            addr: Optional[int] = None
+            name: Optional[str] = None
+            if isinstance(identifier, dict):
+                if "address" in identifier and identifier["address"] is not None:
+                    addr = int(identifier["address"])
+                if "name" in identifier and identifier["name"]:
+                    name = str(identifier["name"])
+                if name is None and "symbol" in identifier and identifier["symbol"]:
+                    name = str(identifier["symbol"])
+            elif isinstance(identifier, str):
+                name = identifier
+            else:
+                addr = int(identifier)
+
+            func_obj = None
+            if addr is not None:
+                func_obj = cfg.kb.functions.get(addr) or cfg.kb.functions.function(addr)
+            if func_obj is None and name is not None:
+                func_obj = cfg.kb.functions.function(name=name)
+            if func_obj is None and name is not None:
+                symbol = project.loader.find_symbol(name)
+                if symbol is not None:
+                    addr = symbol.rebased_addr
+                    func_obj = cfg.kb.functions.get(addr) or cfg.kb.functions.function(addr)
+            if func_obj is None:
+                raise ValueError(f"function identifier {identifier!r} not resolved in call graph")
+            return func_obj.addr, func_obj
+
+        def summarize(addr: int) -> Dict[str, Any]:
+            func = cfg.kb.functions.get(addr)
+            summary = {
+                "addr": addr,
+                "name": func.name if func else f"sub_{addr:x}",
+            }
+            if func is not None:
+                summary["returning"] = func.returning
+                summary["has_unresolved_calls"] = func.has_unresolved_calls
+                if hasattr(func, "block_addrs_set"):
+                    summary["block_count"] = len(func.block_addrs_set)
+            return summary
+
+        src_addr, _ = resolve(source)
+        dst_addr, _ = resolve(target)
+
+        cutoff = max_depth if max_depth is not None else None
+        try:
+            path_iter = nx.all_simple_paths(callgraph, src_addr, dst_addr, cutoff=cutoff)
+        except nx.NodeNotFound as exc:
+            raise ValueError("either source or target not present in call graph") from exc
+        raw_paths = list(itertools.islice(path_iter, max_paths + 1))
+        has_more = len(raw_paths) > max_paths
+        if has_more:
+            raw_paths = raw_paths[:max_paths]
+
+        adjacency: Dict[str, set[str]] = {}
+        paths_payload: List[Dict[str, Any]] = []
+        for path in raw_paths:
+            node_entries = [summarize(addr) for addr in path]
+            paths_payload.append({
+                "length": len(path),
+                "nodes": node_entries,
+            })
+            for head, tail in zip(path, path[1:]):
+                adjacency.setdefault(hex(head), set()).add(hex(tail))
+
+        adjacency_payload = {key: sorted(value) for key, value in adjacency.items()}
+
+        return {
+            "analysis": cfg_key,
+            "source": summarize(src_addr),
+            "target": summarize(dst_addr),
+            "paths": paths_payload,
+            "has_more_paths": has_more,
+            "adjacency": adjacency_payload,
+            "callgraph_nodes": len(callgraph.nodes()),
+            "callgraph_edges": len(callgraph.edges()),
+        }
+
+    # ------------------------------------------------------------------
     def trace_dataflow(
         self,
         project_id: str,
@@ -1153,6 +1307,7 @@ class AngrMCPServer:
         extra_errors: Optional[List[Dict[str, str]]] = None,
         *,
         state_callbacks: Optional[Sequence[Callable[[angr.SimState, str], None]]] = None,
+        state_pressure: Optional[Dict[str, Any]] = None,
     ) -> RunResult:
         ctx = registry.get_project(project_id)
         alert_entries: List[Dict[str, Any]] = []
@@ -1203,6 +1358,7 @@ class AngrMCPServer:
             errors=extra_errors or [],
             alerts=alert_entries,
             stashes=stashes,
+            state_pressure=state_pressure,
             streams=streams,
         )
 

@@ -8,6 +8,7 @@ from .binary import (
     read_c_string,
     read_section_bytes,
 )
+from .exploration import StateBudgetExceeded, StateBudgetLimiter
 from .state import (
     SYMBOL_STORE_KEY,
     StackMutationResult,
@@ -24,6 +25,8 @@ __all__ = [
     "find_string_reference_addresses",
     "read_c_string",
     "read_section_bytes",
+    "StateBudgetExceeded",
+    "StateBudgetLimiter",
     "mutate_registers",
     "mutate_stack",
     "new_symbolic_bitvector",

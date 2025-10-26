@@ -30,6 +30,9 @@ found.
 - `tests/test_phase1_ctf.py` – Phase 1 regression suite recreating angr CTF
   levels 00–04 exclusively through MCP handlers, asserting predicate metadata,
   register/stack mutation APIs, and native replay of recovered inputs.
+- `tests/test_deep_call_partition.py` – Deep-call regression that builds a
+  branching binary, extracts call chains, enforces state-budget guards, and
+  demonstrates chunked symbolic execution reaching a buried target function.
 - `pyproject.toml` – Minimal configuration enabling `uv` to manage a local
   virtual environment.
 - `schemas/` – JSON Schema Draft 2020-12 definitions for every MCP handler
@@ -75,7 +78,9 @@ MCP transport:
 4. `run_symbolic_search` – step or explore states, optionally attaching
    exploration techniques for coverage, loop exhaustion, etc. The handler
    returns new state IDs per stash, emits structured alert records, and
-   registers/updates a job handle that can be resumed later.
+   registers/updates a job handle that can be resumed later. Use the optional
+   `state_budget` parameter to detect and short-circuit state explosion; the
+   run metadata reports the per-stash counts so clients can adapt chunk sizes.
 5. `monitor_for_vulns` – register inspection breakpoints (e.g., `mem_write`)
    so exploit-relevant actions are recorded (alerts accumulate alongside raw
    event logs).
@@ -85,7 +90,9 @@ MCP transport:
    current constraints.
 8. `list_jobs`, `resume_job`, and `delete_job` – manage persisted simulation
    jobs (list metadata, hydrate back into memory, or remove from registry/disk).
-9. `analyze_control_flow` and `trace_dataflow` – generate CFGs and backward
+9. `analyze_call_chain` – compute call-graph paths between functions so deep
+   targets can be decomposed into manageable exploration stages.
+10. `analyze_control_flow` and `trace_dataflow` – generate CFGs and backward
    slices to guide further exploration.
 
 ## Current Status (October 25, 2025)
@@ -101,6 +108,12 @@ MCP transport:
 - Predicate descriptors (`address`, `stdout_contains`, `stdout_not_contains`)
   now drive `run_symbolic_search`, and predicate matches are recorded in the
   run payload alongside base64-encoded stdin/stdout streams.
+- `analyze_call_chain` recovers call-graph paths between functions (using the
+  cached CFG) so deep targets can be chunked into controllable exploration
+  segments.
+- `run_symbolic_search` accepts a `state_budget` cap and reports detailed
+  state-pressure telemetry when the limit is approached or exceeded, allowing
+  front-ends to shrink their search windows before the solver explodes.
 - Helper utilities in `angr_mcp/utils/` expose section scanners and literal
   cross-references used to automate angr CTF level analysis.
 - Jobs created via `run_symbolic_search` can be resumed, enumerated, and
@@ -115,7 +128,9 @@ MCP transport:
 - Integration tests validate the exploit-oriented workflow end to end (requires
   installing `claripy` and `angr` via `uv pip`). Supplementary Phase 1 CTF
   tests assert deterministic solutions for levels 00–04 in
-  `tests/test_phase1_ctf.py`.
+  `tests/test_phase1_ctf.py`. The newly added deep-call regression (`tests/
+  test_deep_call_partition.py`) stresses the call-chain handler, state-budget
+  feedback, and chunked symbolic execution needed for very deep targets.
 
 ## Phase 1 angr_ctf Coverage Highlights
 
