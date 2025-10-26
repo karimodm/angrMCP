@@ -9,7 +9,7 @@ import textwrap
 import unittest
 from typing import Any, Dict, Optional
 
-from angr_mcp import AngrMCPServer
+from angr_mcp.server import AngrMCPServer
 from angr_mcp.registry import registry
 
 

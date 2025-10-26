@@ -13,13 +13,12 @@ from typing import Iterable, List, Tuple
 import angr
 import claripy
 
-from angr_mcp import AngrMCPServer
+from angr_mcp.server import AngrMCPServer
 from angr_mcp.registry import registry
 from angr_mcp.utils import (
     SYMBOL_STORE_KEY,
     extract_uppercase_tokens,
     find_call_to_symbol,
-    new_symbolic_bitvector,
     read_section_bytes,
 )
 

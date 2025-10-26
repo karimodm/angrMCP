@@ -10,7 +10,7 @@ from typing import Iterable, List
 
 import angr
 
-from angr_mcp import AngrMCPServer
+from angr_mcp.server import AngrMCPServer
 from angr_mcp.registry import registry
 from angr_mcp.utils import (
     extract_uppercase_tokens,
@@ -30,6 +30,7 @@ def _skip_if_native_unavailable(exc: OSError) -> None:
 
 class PhaseOneCTFTests(unittest.TestCase):
     _solution_cache: dict[str, dict[str, object]] = {}
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.solutions_root = pathlib.Path("resources/angr_ctf/solutions")
