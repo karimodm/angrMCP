@@ -1,0 +1,15 @@
+[submodule "resources/angr"]
+	path = resources/angr
+	url = git@github.com:angr/angr.git
+[submodule "resources/angr_ctf"]
+	path = resources/angr_ctf
+	url = git@github.com:jakespringer/angr_ctf.git
+[submodule "resources/awesome-angr"]
+	path = resources/awesome-angr
+	url = git@github.com:degrigis/awesome-angr.git
+[submodule "resources/dAngr"]
+	path = resources/dAngr
+	url = git@github.com:angr-debugging/dAngr.git
+[submodule "resources/GhidraMCP"]
+	path = resources/GhidraMCP
+	url = git@github.com:LaurieWired/GhidraMCP.git
