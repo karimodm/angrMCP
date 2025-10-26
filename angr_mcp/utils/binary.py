@@ -185,14 +185,21 @@ def find_call_to_symbol(
     callee = project.loader.find_symbol(callee_symbol)
     if caller is None:
         raise ValueError(f"caller symbol {caller_symbol!r} not found")
-    if callee is None:
-        raise ValueError(f"callee symbol {callee_symbol!r} not found")
+    plt_entries = getattr(project.loader.main_object, "plt", {})
+    if callee is None or getattr(callee, "is_import", False) or callee.owner is not project.loader.main_object:
+        callee_addr = plt_entries.get(callee_symbol)
+        if callee_addr is None:
+            raise ValueError(f"callee symbol {callee_symbol!r} not found")
+    else:
+        callee_addr = callee.rebased_addr
+    if callee_addr in (None, 0):
+        raise ValueError(f"callee symbol {callee_symbol!r} has no resolved address")
 
     caller_addr = caller.rebased_addr
-    callee_addr = callee.rebased_addr
 
-    func = project.kb.functions.function(caller_addr)
-    if func is None:
+    _build_cfg(project)
+    func = project.kb.functions.get(caller_addr) or project.kb.functions.function(caller_addr)
+    if func is None or not getattr(func, "blocks", None):
         raise ValueError(f"function for {caller_symbol!r} not recovered")
 
     count = 0

@@ -39,6 +39,9 @@ for future human or agent contributors working on the angr MCP server project.
 - `tests/test_phase1_ctf.py` – Automates angr CTF levels 00–04 through MCP
   handlers, asserting predicate metadata, register/stack tooling, and native
   replay.
+- `tests/test_deep_call_partition.py` – Builds a deeply nested binary and
+  exercises call-chain recovery, state-budget limits, and chunked symbolic
+  execution to reach a buried function.
 - `pyproject.toml` – Minimal configuration for `uv` environment management.
 
 ## Implemented Workflow (Session Summary)
@@ -75,6 +78,15 @@ for future human or agent contributors working on the angr MCP server project.
     scans and literal cross-referencing used by Phase 1 automation.
 12. Authored Phase 1 angr CTF regression tests validating levels 00–04 via the
     MCP tooling and confirming native execution of recovered inputs.
+13. Added `analyze_call_chain`, caching CFG results to surface caller→callee
+    paths so assistants can plan deep explorations without recomputing graph
+    analyses.
+14. Introduced a `state_budget` guard in `run_symbolic_search`; the handler now
+    reports per-stash state pressure and interrupts runs when limits are
+    exceeded so clients can shrink their search windows.
+15. Landed the deep-call regression (`tests/test_deep_call_partition.py`) that
+    compiles a wide branch tree and demonstrates chunked exploration via the
+    new call-chain handler and state-budget feedback.
 
 ## Collaboration Rules
 
