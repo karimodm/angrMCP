@@ -255,10 +255,13 @@ def run_symbolic_search(
 ) -> Dict[str, Any]:
     """Advance symbolic execution from a state or simulation manager.
 
-    Tip: treat this as a bounded, repeatable step. Always set ``state_budget``
-    (and optionally ``budget_stashes``) so the solver cannot explode on large
-    programs, and consider ``persist_job=True`` to resume the run in short,
-    controlled bursts (e.g. 100–200 total states at a time).
+    Use this when you need block-by-block reachability instead of whole-function
+    views. Symbolic execution will traverse concrete basic blocks, revealing the
+    precise branch predicates and successor states that static decompilation
+    glosses over. Tip: treat the run as a bounded, repeatable step—always set
+    ``state_budget`` (and optionally ``budget_stashes``) so the solver cannot
+    explode on large programs, and consider ``persist_job=True`` to resume the
+    run in short, controlled bursts (e.g. 100–200 total states at a time).
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -471,9 +474,10 @@ def analyze_call_chain(
 ) -> Dict[str, Any]:
     """Return call-graph paths between two locations, caching underlying CFG results.
 
-    This is the lightweight bridge from structural analysis to symbolic runs:
-    request only the paths you need, stash the cached CFG, and then focus
-    symbolic search on the specific segments that matter.
+    Static tools surface entire functions; this call narrows the search to the
+    chain of basic blocks that actually connect your source and target. Use it
+    to carve the CFG into bite-sized segments before launching symbolic runs on
+    those blocks.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -509,9 +513,10 @@ def trace_dataflow(
 ) -> Dict[str, Any]:
     """Compute a backward slice rooted at the given address and statement index.
 
-    Pair this with ``analyze_call_chain`` and budgeted exploration to expose the
-    precise data/control dependencies that must hold before launching another
-    short symbolic run.
+    Combine this block-scoped slice with ``analyze_call_chain`` to highlight the
+    exact predecessors and data dependencies that feed your target. It turns
+    broad, function-level dumps into concrete constraints you can check with
+    short symbolic runs.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
