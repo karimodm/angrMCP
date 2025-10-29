@@ -38,6 +38,10 @@ def load_project(
 ) -> Dict[str, Any]:
     """Load a program into angr and register it with the MCP registry.
 
+    Use this to initialise only the binary you intend to explore symbolically.
+    When paired with lightweight load options (e.g., ``auto_load_libs=False``),
+    it provides the minimal foundation for later, budgeted reachability runs.
+
     Args:
         binary_path: Path to the binary to analyse. Relative paths are resolved from the
             current working directory.
@@ -82,6 +86,11 @@ def setup_symbolic_context(
     remove_options: Optional[Iterable[Any]] = None,
 ) -> Dict[str, Any]:
     """Create and register a symbolic execution state for the given project.
+
+    Build narrow states that reflect the exact execution slice you care about:
+    pick the closest factory (`"entry"`, `"blank"`, etc.), introduce only the
+    necessary symbolic data, and keep everything else concrete so subsequent
+    searches stay tractable.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -133,6 +142,9 @@ def instrument_environment(
 ) -> Dict[str, Any]:
     """Install simprocedures or Python callables at specific addresses or symbols.
 
+    Hook only the routines that impact your chosen path (e.g., stubbing I/O)
+    so you can focus the symbolic executor on the reachability question at hand.
+
     Args:
         project_id: Identifier returned by :func:`load_project`.
         hooks: Sequence of hook definitions. Each entry accepts ``address`` or ``symbol``
@@ -161,6 +173,10 @@ def mutate_state(
     remove_options: Optional[Iterable[Any]] = None,
 ) -> Dict[str, Any]:
     """Apply register, stack, memory, or option mutations to a recorded state.
+
+    Use this after initial setup to incrementally steer a state—forcing concrete
+    preconditions, introducing fresh symbols, or toggling options before you
+    resume a budgeted exploration.
 
     Args:
         project_id: Project identifier returned by :func:`load_project`.
@@ -199,6 +215,9 @@ def add_constraints(
 ) -> Dict[str, Any]:
     """Add solver constraints to a state.
 
+    Tighten the search space between exploration bursts by pinning values or
+    relating symbolic bytes discovered earlier to new requirements.
+
     Args:
         project_id: Project identifier returned by :func:`load_project`.
         state_id: State identifier to mutate.
@@ -235,6 +254,11 @@ def run_symbolic_search(
     job_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Advance symbolic execution from a state or simulation manager.
+
+    Tip: treat this as a bounded, repeatable step. Always set ``state_budget``
+    (and optionally ``budget_stashes``) so the solver cannot explode on large
+    programs, and consider ``persist_job=True`` to resume the run in short,
+    controlled bursts (e.g. 100–200 total states at a time).
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -283,6 +307,9 @@ def monitor_for_vulns(
 ) -> Dict[str, Any]:
     """Register angr inspector callbacks that report high-risk runtime events.
 
+    Attach monitors to the specific state you plan to explore so each bounded
+    search run yields exploit-relevant telemetry without re-running analyses.
+
     Args:
         project_id: Identifier returned by :func:`load_project`.
         state_id: State identifier to monitor.
@@ -299,6 +326,9 @@ def monitor_for_vulns(
 def list_jobs(project_id: str) -> Dict[str, Any]:
     """List symbolic execution jobs recorded for the given project.
 
+    Budgeted searches produce many short runs; use this to enumerate saved
+    snapshots that you can resume or prune later.
+
     Args:
         project_id: Identifier returned by :func:`load_project`.
 
@@ -312,6 +342,9 @@ def list_jobs(project_id: str) -> Dict[str, Any]:
 @mcp.tool()
 def resume_job(project_id: str, job_id: str) -> Dict[str, Any]:
     """Reload a previously recorded symbolic execution job.
+
+    Rehydrate a persisted search chunk (created via ``persist_job=True``) so
+    you can keep exploring a path without restarting from the binary entry.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -333,6 +366,9 @@ def delete_job(
     remove_disk: bool = False,
 ) -> Dict[str, Any]:
     """Delete a recorded job and optionally remove its persisted snapshot.
+
+    Clean up exploration branches you no longer need once you have extracted
+    the relevant path or inputs.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -360,6 +396,9 @@ def inspect_state(
     globals_keys: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Summarise a recorded state, including registers, memory, constraints, and alerts.
+
+    Call this between exploration bursts to checkpoint progress, extract alert
+    logs, or pull register/memory snapshots before adding fresh constraints.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -400,6 +439,10 @@ def solve_constraints(
 ) -> Dict[str, Any]:
     """Evaluate symbolic expressions for the given state.
 
+    Use solver queries to extract concrete witnesses (inputs, register values)
+    once a bounded run reaches the desired state, then feed them back into
+    native repro or further constraint tightening.
+
     Args:
         project_id: Identifier returned by :func:`load_project`.
         state_id: State identifier containing the solver context.
@@ -418,28 +461,6 @@ def solve_constraints(
 
 
 @mcp.tool()
-def analyze_control_flow(
-    project_id: str,
-    *,
-    force_fast: bool = False,
-    keep_state: bool = False,
-) -> Dict[str, Any]:
-    """Build or reuse a CFG analysis for the project.
-
-    Args:
-        project_id: Identifier returned by :func:`load_project`.
-        force_fast: Use ``CFGFast`` instead of the default ``CFGEmulated`` analysis.
-        keep_state: Preserve execution state when running ``CFGEmulated``.
-
-    Returns:
-        Dictionary with the analysis ``kind`` and summary information including nodes,
-        edges, and entry address.
-    """
-
-    return SERVER.analyze_control_flow(project_id, force_fast=force_fast, keep_state=keep_state)
-
-
-@mcp.tool()
 def analyze_call_chain(
     project_id: str,
     *,
@@ -449,6 +470,10 @@ def analyze_call_chain(
     max_depth: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Return call-graph paths between two locations, caching underlying CFG results.
+
+    This is the lightweight bridge from structural analysis to symbolic runs:
+    request only the paths you need, stash the cached CFG, and then focus
+    symbolic search on the specific segments that matter.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -483,6 +508,10 @@ def trace_dataflow(
     use_cdg: bool = False,
 ) -> Dict[str, Any]:
     """Compute a backward slice rooted at the given address and statement index.
+
+    Pair this with ``analyze_call_chain`` and budgeted exploration to expose the
+    precise data/control dependencies that must hold before launching another
+    short symbolic run.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -521,7 +550,6 @@ __all__ = [
     "delete_job",
     "inspect_state",
     "solve_constraints",
-    "analyze_control_flow",
     "analyze_call_chain",
     "trace_dataflow",
 ]

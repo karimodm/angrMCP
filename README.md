@@ -92,8 +92,8 @@ MCP transport:
    jobs (list metadata, hydrate back into memory, or remove from registry/disk).
 9. `analyze_call_chain` – compute call-graph paths between functions so deep
    targets can be decomposed into manageable exploration stages.
-10. `analyze_control_flow` and `trace_dataflow` – generate CFGs and backward
-   slices to guide further exploration.
+10. `trace_dataflow` – run backward slices (optionally with DDG/CDG) to expose
+    dependencies that matter for a chosen target.
 
 ## Current Status (October 25, 2025)
 

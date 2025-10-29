@@ -227,6 +227,7 @@ class TestDeepCallPartition(unittest.TestCase):
         current_state = fresh_entry["state_id"]
 
         node_addresses = [entry["addr"] for entry in primary_path]
+        self.assertTrue(all(addr.startswith("0x") for addr in node_addresses))
         total_stages = len(self.KEY_SEQUENCE)
         final_index = len(node_addresses) - 1
 

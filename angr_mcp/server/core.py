@@ -32,6 +32,12 @@ from ..utils import (
 )
 
 
+def _format_addr(value: Optional[int]) -> Optional[str]:
+    if value is None:
+        return None
+    return f"0x{value:x}"
+
+
 @dataclass
 class RunResult:
     simgr_id: str
@@ -100,12 +106,17 @@ class PredicateEngine:
 
     # ------------------------------------------------------------------
     def _record_match(self, descriptor: Dict[str, Any], state: angr.SimState, details: Dict[str, Any]) -> None:
+        state_addr = int(getattr(state, "addr", 0) or 0)
+        details = dict(details)
+        if "address" in details and details["address"] is not None:
+            details["address"] = _format_addr(int(details["address"]))
+
         entry = {
             "predicate_id": descriptor["id"],
             "kind": descriptor["kind"],
             "role": self.role,
             "state_id": None,
-            "state_addr": int(getattr(state, "addr", 0) or 0),
+            "state_addr": _format_addr(state_addr),
             "details": details,
         }
         self._pending.setdefault(id(state), []).append(entry)
@@ -158,13 +169,13 @@ class AngrMCPServer:
         for obj in loader.all_objects:
             objects.append(
                 {
-                    "min_addr": obj.min_addr,
-                    "max_addr": obj.max_addr,
+                    "min_addr": _format_addr(getattr(obj, "min_addr", None)),
+                    "max_addr": _format_addr(getattr(obj, "max_addr", None)),
                     "binary": getattr(obj, "binary", None),
-                    "entry": getattr(obj, "entry", None),
+                    "entry": _format_addr(getattr(obj, "entry", None)),
                     "segments": [
                         {
-                            "vaddr": getattr(seg, "vaddr", None),
+                            "vaddr": _format_addr(getattr(seg, "vaddr", None)),
                             "memsize": getattr(seg, "memsize", None),
                             "flags": getattr(seg, "flags", None),
                         }
@@ -176,7 +187,7 @@ class AngrMCPServer:
         return {
             "arch": project.arch.name,
             "bits": project.arch.bits,
-            "entry": project.entry,
+            "entry": _format_addr(project.entry),
             "filename": project.filename,
             "objects": objects,
         }
@@ -254,7 +265,7 @@ class AngrMCPServer:
             "kind": descriptor["kind"],
         }
         if descriptor["kind"] == "address":
-            payload["address"] = int(descriptor["address"])
+            payload["address"] = _format_addr(int(descriptor["address"]))
             payload["description"] = descriptor.get("description")
         else:
             payload["text"] = descriptor.get("text")
@@ -272,7 +283,7 @@ class AngrMCPServer:
             bits = size * 8
             symbol, metadata = new_symbolic_bitvector(state, label, bits, handle_prefix="mem")
             state.memory.store(address, symbol)
-            entry = {"address": address, "size": size}
+            entry = {"address": _format_addr(address), "size": size}
             entry.update(metadata)
             entries.append(entry)
         return entries
@@ -417,7 +428,7 @@ class AngrMCPServer:
         self,
         binary_path: str,
         *,
-        auto_load_libs: bool = True,
+        auto_load_libs: bool = False,
         load_options: Optional[Dict[str, Any]] = None,
         exclude_sim_procedures_list: Optional[Iterable[str]] = None,
         exclude_sim_procedures_func: Optional[str] = None,
@@ -433,6 +444,7 @@ class AngrMCPServer:
             exclude_sim_procedures_list=list(exclude_sim_procedures_list or []),
             exclude_sim_procedures_func=exclude_sim_procedures_func,
             use_sim_procedures=use_sim_procedures,
+            main_opts={"base_addr": 0x00100000}  # To align with Ghidra
         )
 
         metadata = self._project_metadata(project)
@@ -524,10 +536,17 @@ class AngrMCPServer:
         state_id = registry.register_state(project_id, state)
 
         solver = state.solver
+
+        def safe_reg(reg_attr: Any) -> Optional[str]:
+            try:
+                return _format_addr(int(solver.eval(reg_attr)))
+            except Exception:  # pylint:disable=broad-except
+                return None
+
         register_snapshot = {
-            "ip": solver.eval(state.regs.ip),
-            "sp": solver.eval(state.regs.sp),
-            "bp": solver.eval(state.regs.bp) if hasattr(state.regs, "bp") else None,
+            "ip": safe_reg(state.regs.ip),
+            "sp": safe_reg(state.regs.sp),
+            "bp": safe_reg(getattr(state.regs, "bp", None)) if hasattr(state.regs, "bp") else None,
         }
 
         symbolic_payload: Dict[str, Any] = {}
@@ -552,6 +571,12 @@ class AngrMCPServer:
         }
         mutations_dict = mutation_summary.to_dict()
         if mutations_dict:
+            for entry in mutations_dict.get("memory", []):
+                if entry.get("address") is not None:
+                    entry["address"] = _format_addr(int(entry["address"]))
+            for entry in mutations_dict.get("stack", []):
+                if entry.get("stack_pointer") is not None:
+                    entry["stack_pointer"] = _format_addr(int(entry["stack_pointer"]))
             response["mutations"] = mutations_dict
         if symbolic_payload:
             response["symbolic"] = symbolic_payload
@@ -608,7 +633,7 @@ class AngrMCPServer:
             )
             registry.register_hook(project_id, hook_id, descriptor)
             applied[hook_id] = {
-                "address": address,
+                "address": _format_addr(address) if address is not None else None,
                 "symbol": symbol,
                 "description": description,
             }
@@ -951,12 +976,26 @@ class AngrMCPServer:
         def make_callback(event_name: str):
             def _callback(state: angr.SimState) -> None:
                 solver = state.solver
-                entry = {"event": event_name, "addr": solver.eval(state.regs.ip)}
+                try:
+                    ip_value = int(solver.eval(state.regs.ip))
+                except Exception:  # pylint:disable=broad-except
+                    ip_value = None
+                entry = {"event": event_name, "addr": _format_addr(ip_value)}
                 if event_name == "mem_write":
                     addr_ast = state.inspect.mem_write_address
                     length_ast = state.inspect.mem_write_length
-                    entry["address"] = solver.eval(addr_ast)
-                    entry["length"] = solver.eval(length_ast)
+                    address_value = None
+                    if addr_ast is not None:
+                        try:
+                            address_value = int(solver.eval(addr_ast))
+                        except Exception:  # pylint:disable=broad-except
+                            address_value = None
+                    entry["address"] = _format_addr(address_value)
+                    if length_ast is not None:
+                        try:
+                            entry["length"] = int(solver.eval(length_ast))
+                        except Exception:  # pylint:disable=broad-except
+                            entry["length"] = None
                 registry.record_event(project_id, state_id, entry)
 
             return _callback
@@ -1027,7 +1066,7 @@ class AngrMCPServer:
                 concrete = None
             mem_dump.append(
                 {
-                    "address": addr,
+                    "address": _format_addr(addr),
                     "size": size,
                     "concrete": concrete,
                 }
@@ -1083,7 +1122,7 @@ class AngrMCPServer:
                 addr = query["address"]
                 size = query["size"]
                 ast = state.memory.load(addr, size)
-                item = {"kind": kind, "address": addr, "size": size}
+                item = {"kind": kind, "address": _format_addr(addr), "size": size}
             elif kind == "register":
                 reg = query["name"]
                 ast = getattr(state.regs, reg)
@@ -1109,40 +1148,6 @@ class AngrMCPServer:
             results.append(item)
 
         return {"results": results}
-
-    # ------------------------------------------------------------------
-    def analyze_control_flow(
-        self,
-        project_id: str,
-        *,
-        force_fast: bool = False,
-        keep_state: bool = False,
-    ) -> Dict[str, Any]:
-        ctx = registry.get_project(project_id)
-        project = ctx.project
-        if force_fast:
-            cfg = project.analyses.CFGFast()
-            kind = "CFGFast"
-        else:
-            cfg = project.analyses.CFGEmulated(keep_state=keep_state)
-            kind = "CFGEmulated"
-
-        ctx.cfg_cache[kind] = cfg
-        functions = [
-            {
-                "addr": func.addr,
-                "name": func.name,
-                "returning": func.returning,
-                "has_unresolved_calls": func.has_unresolved_calls,
-            }
-            for func in cfg.kb.functions.values()
-        ]
-        return {
-            "analysis": kind,
-            "node_count": len(cfg.graph.nodes()),
-            "edge_count": len(cfg.graph.edges()),
-            "functions": functions,
-        }
 
     # ------------------------------------------------------------------
     def analyze_call_chain(
@@ -1175,7 +1180,7 @@ class AngrMCPServer:
 
         callgraph = cfg.kb.callgraph
         if callgraph is None:
-            raise RuntimeError("call graph unavailable; run analyze_control_flow first")
+            raise RuntimeError("call graph unavailable even after generating the CFG")
 
         def resolve(identifier: Any) -> Tuple[int, Any]:
             addr: Optional[int] = None
@@ -1209,7 +1214,7 @@ class AngrMCPServer:
         def summarize(addr: int) -> Dict[str, Any]:
             func = cfg.kb.functions.get(addr)
             summary = {
-                "addr": addr,
+                "addr": _format_addr(addr),
                 "name": func.name if func else f"sub_{addr:x}",
             }
             if func is not None:
@@ -1241,7 +1246,7 @@ class AngrMCPServer:
                 "nodes": node_entries,
             })
             for head, tail in zip(path, path[1:]):
-                adjacency.setdefault(hex(head), set()).add(hex(tail))
+                adjacency.setdefault(_format_addr(head), set()).add(_format_addr(tail))
 
         adjacency_payload = {key: sorted(value) for key, value in adjacency.items()}
 
@@ -1276,6 +1281,18 @@ class AngrMCPServer:
         cdg = project.analyses.CDG(cfg) if use_cdg else None
         ddg = project.analyses.DDG(cfg) if use_ddg else None
 
+        def format_node(node: Any) -> Any:
+            if isinstance(node, int):
+                return _format_addr(node)
+            if hasattr(node, "addr"):
+                addr_value = getattr(node, "addr")
+                if isinstance(addr_value, int):
+                    return _format_addr(addr_value)
+            return node
+
+        def format_node_list(nodes: Iterable[Any]) -> List[Any]:
+            return [format_node(node) for node in nodes]
+
         bs = project.analyses.BackwardSlice(
             cfg,
             cdg=cdg,
@@ -1285,16 +1302,16 @@ class AngrMCPServer:
         )
 
         result = {
-            "runs_in_slice": list(bs.runs_in_slice.nodes()) if hasattr(bs, "runs_in_slice") else [],
-            "cfg_nodes_in_slice": list(bs.cfg_nodes_in_slice.nodes()) if hasattr(bs, "cfg_nodes_in_slice") else [],
-        }
+            "runs_in_slice": format_node_list(bs.runs_in_slice.nodes()) if hasattr(bs, "runs_in_slice") else [],
+            "cfg_nodes_in_slice": format_node_list(bs.cfg_nodes_in_slice.nodes())
+            if hasattr(bs, "cfg_nodes_in_slice") else [], }
         if hasattr(bs, "chosen_statements"):
             result["chosen_statements"] = {
-                hex(addr): stmts for addr, stmts in bs.chosen_statements.items()
+                _format_addr(addr): stmts for addr, stmts in bs.chosen_statements.items()
             }
         if hasattr(bs, "chosen_exits"):
             result["chosen_exits"] = {
-                hex(addr): exits for addr, exits in bs.chosen_exits.items()
+                _format_addr(addr): exits for addr, exits in bs.chosen_exits.items()
             }
         return result
 
@@ -1545,9 +1562,17 @@ class AngrMCPServer:
             "timestamp": alert.timestamp,
         }
         if alert.address is not None:
-            data["address"] = alert.address
+            data["address"] = _format_addr(alert.address)
         if alert.details:
-            data["details"] = alert.details
+            details = dict(alert.details)
+            if "stack_pointer" in details and details["stack_pointer"] is not None:
+                details["stack_pointer"] = _format_addr(int(details["stack_pointer"]))
+            if "samples" in details and isinstance(details["samples"], list):
+                details["samples"] = [
+                    _format_addr(int(sample)) if sample is not None else None
+                    for sample in details["samples"]
+                ]
+            data["details"] = details
         return data
 
     # ------------------------------------------------------------------

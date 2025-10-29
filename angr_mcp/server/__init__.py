@@ -4,7 +4,6 @@ from .core import AngrMCPServer, PredicateEngine, RunResult
 from .tools import (
     SERVER,
     analyze_call_chain,
-    analyze_control_flow,
     add_constraints,
     delete_job,
     inspect_state,
@@ -39,7 +38,6 @@ __all__ = [
     "delete_job",
     "inspect_state",
     "solve_constraints",
-    "analyze_control_flow",
     "analyze_call_chain",
     "trace_dataflow",
 ]

@@ -223,12 +223,18 @@ class TestAngrMCPServer(unittest.TestCase):
         self.assertFalse(job_path.exists())
 
     # ------------------------------------------------------------------
-    def test_cfg_and_slice(self) -> None:
+    def test_call_chain_and_slice(self) -> None:
         project = registry.get_project(self.project_id).project
-        cfg_info = self.server.analyze_control_flow(self.project_id, force_fast=True)
-        self.assertGreater(cfg_info["node_count"], 0)
-
         win_addr = project.loader.find_symbol("win").rebased_addr
+        call_chain = self.server.analyze_call_chain(
+            self.project_id,
+            source={"symbol": "main"},
+            target={"address": win_addr},
+        )
+        self.assertTrue(call_chain["paths"], "Expected at least one call-chain path")
+        first_path = call_chain["paths"][0]["nodes"]
+        self.assertTrue(all(node["addr"].startswith("0x") for node in first_path))
+
         slice_info = self.server.trace_dataflow(self.project_id, target_addr=win_addr)
         self.assertIn("runs_in_slice", slice_info)
 
