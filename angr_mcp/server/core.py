@@ -1557,7 +1557,14 @@ class AngrMCPServer:
 
         regs = {}
         for reg_name in registers or []:
-            regs[reg_name] = int(getattr(state.regs, reg_name))
+            reg_ast = getattr(state.regs, reg_name)
+            try:
+                if isinstance(reg_ast, claripy.ast.Base):
+                    regs[reg_name] = state.solver.eval(reg_ast)
+                else:
+                    regs[reg_name] = int(reg_ast)
+            except Exception:  # pylint:disable=broad-except
+                regs[reg_name] = None
         if regs:
             data["registers"] = regs
 
