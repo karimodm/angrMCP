@@ -1,9 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "delete_job response",
-  "type": "object",
-  "required": ["deleted"],
-  "properties": {
-    "deleted": {"$ref": "common.json#/$defs/uuid"}
-  }
-}
