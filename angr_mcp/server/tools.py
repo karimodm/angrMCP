@@ -303,6 +303,72 @@ def run_symbolic_search(
 
 
 @mcp.tool()
+def run_taint_analysis(
+    project_id: str,
+    *,
+    state_id: str,
+    tracker_options: Optional[Dict[str, Any]] = None,
+    sources: Optional[Sequence[Dict[str, Any]]] = None,
+    sinks: Optional[Sequence[Dict[str, Any]]] = None,
+    use_dfs: bool = True,
+    techniques: Optional[Sequence[str]] = None,
+    stop_on_first_hit: bool = False,
+    max_sink_hits: Optional[int] = None,
+    state_budget: Optional[int] = None,
+    budget_stashes: Optional[Sequence[str]] = None,
+    max_steps: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Track how tainted data flows through the program.
+
+    Use this when you need to prove that attacker-controlled bytes reach a
+    sensitive sink (format string, indirect jump, pointer dereference, etc.).
+    Mark one or more *sources* that should be tainted (memory, registers, or
+    pointers that get re-tainted on writes), then describe *sinks* by giving
+    the block address and what must be tainted at that moment. The server runs
+    a taint-aware symbolic execution, logs every sink hit (with the state ID
+    you can inspect later), and returns a summary of the propagation.
+
+    Args:
+        project_id: Identifier returned by :func:`load_project`.
+        state_id: Base state identifier created via :func:`setup_symbolic_context`.
+        tracker_options: Keyword arguments forwarded to :class:`TaintTracker`.
+        sources: List of taint source descriptors. Supported kinds:
+            ``"memory"`` (requires ``address`` and optional ``size``/``monitor_writes``)
+            or ``"register"`` (requires ``name`` and optional ``bits``).
+        sinks: List of sink descriptors. Each entry requires ``address`` and optional
+            ``checks`` describing what should be tainted (``register``, ``memory``,
+            or ``pointer`` dereferences). ``mode`` controls whether *any* or *all*
+            checks must be tainted.
+        use_dfs: Enable the bundled DFS exploration technique for tighter search.
+        techniques: Additional exploration techniques (by name) to stack with taint tracking.
+        stop_on_first_hit: Stop execution after the first sink triggers.
+        max_sink_hits: Hard cap on recorded sink hits; execution stops at the limit.
+        state_budget: Optional state budget enforced via :class:`StateBudgetLimiter`.
+        budget_stashes: Stashes counted toward ``state_budget``.
+        max_steps: Maximum number of simulation steps before stopping.
+
+    Returns:
+        A payload containing the symbolic run metadata plus a ``taint`` block with
+        configured sources/sinks and every recorded sink hit (each tied to a new state_id).
+    """
+
+    return SERVER.run_taint_analysis(
+        project_id,
+        state_id=state_id,
+        tracker_options=tracker_options,
+        sources=sources,
+        sinks=sinks,
+        use_dfs=use_dfs,
+        techniques=techniques,
+        stop_on_first_hit=stop_on_first_hit,
+        max_sink_hits=max_sink_hits,
+        state_budget=state_budget,
+        budget_stashes=budget_stashes,
+        max_steps=max_steps,
+    )
+
+
+@mcp.tool()
 def monitor_for_vulns(
     project_id: str,
     state_id: str,

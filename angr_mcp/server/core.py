@@ -12,7 +12,7 @@ import pickle
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import angr
 import claripy
@@ -30,6 +30,8 @@ from ..utils import (
     mutate_stack,
     new_symbolic_bitvector,
 )
+from .taint_engine import TaintTracker, apply_taint, is_tainted, new_tainted_value
+from .taint_engine.dfs import DFS
 
 
 def _format_addr(value: Optional[int]) -> Optional[str]:
@@ -53,6 +55,7 @@ class RunResult:
     streams: Dict[str, Dict[str, str]] = field(default_factory=dict)
     predicate_matches: List[Dict[str, Any]] = field(default_factory=list)
     state_pressure: Optional[Dict[str, Any]] = None
+    taint_hits: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class PredicateEngine:
@@ -789,6 +792,8 @@ class AngrMCPServer:
         project = ctx.project
 
         job_ctx: Optional[JobContext] = None
+        technique_names = [name.lower() for name in (techniques or [])]
+        handled_techniques: Set[str] = set()
 
         find_runtime, find_serialized = self._normalize_predicate_specs(find)
         avoid_runtime, avoid_serialized = self._normalize_predicate_specs(avoid)
@@ -814,7 +819,11 @@ class AngrMCPServer:
             if state_id is None:
                 raise ValueError("state_id required when creating new sim manager")
             state = registry.get_state(project_id, state_id)
-            simgr = project.factory.simulation_manager(state)
+            simgr_kwargs: Dict[str, Any] = {}
+            if "veritesting" in technique_names:
+                simgr_kwargs["veritesting"] = True
+                handled_techniques.add("veritesting")
+            simgr = project.factory.simulation_manager(state, **simgr_kwargs)
             simgr_id = registry.register_simmanager(project_id, simgr)
             if job_ctx is None and job_id:
                 # a job was requested but no persisted state existed; initialize a new job context shell
@@ -833,7 +842,19 @@ class AngrMCPServer:
             budget_limiter = StateBudgetLimiter(state_budget, stashes=budget_stashes)
             simgr.use_technique(budget_limiter)
 
+        if "veritesting" in technique_names and "veritesting" not in handled_techniques:
+            try:
+                from angr.exploration_techniques.veritesting import Veritesting as _Veritesting
+
+                if not any(isinstance(t, _Veritesting) for t in getattr(simgr, "_techniques", [])):
+                    simgr.use_technique(_Veritesting())
+            except ImportError:
+                pass
+            handled_techniques.add("veritesting")
+
         for tech_name in techniques or []:
+            if tech_name.lower() in handled_techniques:
+                continue
             technique = self._load_technique(tech_name, project)
             if technique is not None:
                 simgr.use_technique(technique)
@@ -961,6 +982,491 @@ class AngrMCPServer:
 
         run_payload = dict(result.__dict__)
         return {"run": run_payload}
+
+    # ------------------------------------------------------------------
+    def run_taint_analysis(
+        self,
+        project_id: str,
+        *,
+        state_id: str,
+        tracker_options: Optional[Dict[str, Any]] = None,
+        sources: Optional[Sequence[Dict[str, Any]]] = None,
+        sinks: Optional[Sequence[Dict[str, Any]]] = None,
+        use_dfs: bool = True,
+        techniques: Optional[Sequence[str]] = None,
+        stop_on_first_hit: bool = False,
+        max_sink_hits: Optional[int] = None,
+        state_budget: Optional[int] = None,
+        budget_stashes: Optional[Sequence[str]] = None,
+        max_steps: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not state_id:
+            raise ValueError("state_id required for taint analysis")
+
+        ctx = registry.get_project(project_id)
+        project = ctx.project
+        base_state = registry.get_state(project_id, state_id)
+        state = base_state.copy()
+        simgr = project.factory.simulation_manager(state)
+        simgr_id = registry.register_simmanager(project_id, simgr)
+
+        tracker_kwargs = dict(tracker_options or {})
+        tracker = TaintTracker(**tracker_kwargs)
+
+        def _coerce_int(value: Any, name: str) -> int:
+            if isinstance(value, str):
+                return int(value, 0)
+            if value is None:
+                raise ValueError(f"{name} is required")
+            return int(value)
+
+        def _sanitize_check(spec: Dict[str, Any]) -> Dict[str, Any]:
+            kind = spec.get("kind")
+            if kind == "register":
+                return {"kind": "register", "name": spec["name"]}
+            if kind == "memory":
+                addr = _coerce_int(spec["address"], "address")
+                size = int(spec.get("size", 1))
+                return {"kind": "memory", "address": _format_addr(addr), "size": size}
+            if kind == "pointer":
+                size = int(spec.get("size", 1))
+                return {"kind": "pointer", "register": spec["register"], "size": size}
+            raise ValueError(f"unsupported sink check kind: {spec!r}")
+
+        memory_monitors: List[Callable[[angr.SimState], None]] = []
+        source_records: List[Dict[str, Any]] = []
+
+        for index, source_spec in enumerate(sources or []):
+            kind = source_spec.get("kind")
+            source_id = source_spec.get("id", f"source_{index}")
+            label = source_spec.get("label")
+
+            if kind == "memory":
+                address = _coerce_int(source_spec.get("address"), "address")
+                size = int(source_spec.get("size", 1))
+                if size <= 0:
+                    raise ValueError("memory source size must be positive")
+                label = label or f"mem_{address:#x}"
+                apply_taint(state, address, taint_id=label, bits=size * 8)
+
+                monitor_writes = bool(source_spec.get("monitor_writes", False))
+
+                if monitor_writes:
+
+                    def _memory_callback(
+                        st: angr.SimState,
+                        *,
+                        base_addr: int = address,
+                        span: int = size,
+                        tag: str = label,
+                    ) -> None:
+                        addr_ast = st.inspect.mem_write_address
+                        if addr_ast is None:
+                            return
+                        try:
+                            write_addr = int(st.solver.eval(addr_ast))
+                        except Exception:  # pylint:disable=broad-except
+                            return
+                        length_ast = st.inspect.mem_write_length
+                        if length_ast is not None:
+                            try:
+                                write_len = int(st.solver.eval(length_ast))
+                            except Exception:  # pylint:disable=broad-except
+                                write_len = span
+                        else:
+                            write_len = span
+                        overlap_start = max(write_addr, base_addr)
+                        overlap_end = min(write_addr + write_len, base_addr + span)
+                        if overlap_start >= overlap_end:
+                            return
+                        chunk = overlap_end - overlap_start
+                        apply_taint(st, overlap_start, taint_id=f"{tag}@{overlap_start:#x}", bits=chunk * 8)
+
+                    memory_monitors.append(_memory_callback)
+
+                source_records.append(
+                    {
+                        "id": source_id,
+                        "kind": "memory",
+                        "address": _format_addr(address),
+                        "size": size,
+                        "label": label,
+                        "monitor_writes": monitor_writes,
+                    }
+                )
+                continue
+
+            if kind == "memory_pointer":
+                reg_name = source_spec.get("register")
+                if reg_name is None:
+                    raise ValueError("memory_pointer source requires 'register'")
+                range_size = source_spec.get("size")
+                explicit_size = int(range_size) if range_size is not None else None
+                label = label or f"ptr_{reg_name}"
+
+                def _pointer_callback(
+                    st: angr.SimState,
+                    *,
+                    reg: str = reg_name,
+                    span: Optional[int] = explicit_size,
+                    tag: str = label,
+                ) -> None:
+                    addr_ast = st.inspect.mem_write_address
+                    if addr_ast is None:
+                        return
+                    try:
+                        write_addr = int(st.solver.eval(addr_ast))
+                    except Exception:  # pylint:disable=broad-except
+                        return
+
+                    try:
+                        ptr_base = int(st.solver.eval(getattr(st.regs, reg)))
+                    except Exception:  # pylint:disable=broad-except
+                        ptr_base = None
+                    if ptr_base is None:
+                        return
+
+                    length_ast = st.inspect.mem_write_length
+                    if length_ast is not None:
+                        try:
+                            write_len = int(st.solver.eval(length_ast))
+                        except Exception:  # pylint:disable=broad-except
+                            write_len = span or 1
+                    else:
+                        write_len = span or 1
+                    if write_len <= 0:
+                        write_len = span or 1
+
+                    ptr_span = span or write_len
+                    ptr_end = ptr_base + ptr_span
+                    overlap_start = max(write_addr, ptr_base)
+                    overlap_end = min(write_addr + write_len, ptr_end)
+
+                    if overlap_start >= overlap_end:
+                        return
+
+                    chunk = overlap_end - overlap_start
+                    apply_taint(st, overlap_start, taint_id=f"{tag}@{overlap_start:#x}", bits=chunk * 8)
+
+                memory_monitors.append(_pointer_callback)
+                source_records.append(
+                    {
+                        "id": source_id,
+                        "kind": "memory_pointer",
+                        "register": reg_name,
+                        "size": explicit_size,
+                        "label": label,
+                    }
+                )
+                continue
+
+            if kind == "register":
+                reg_name = source_spec.get("name")
+                if reg_name is None:
+                    raise ValueError("register source requires 'name'")
+                reg_meta = state.arch.registers.get(reg_name)
+                reg_bits = None
+                if reg_meta is not None:
+                    reg_bits = int(reg_meta[1]) * 8
+                bits = int(source_spec.get("bits", reg_bits or state.arch.bits))
+                if bits <= 0:
+                    raise ValueError("register source bits must be positive")
+                label = label or f"reg_{reg_name}"
+                tainted = new_tainted_value(label, bits=bits)
+                setattr(state.regs, reg_name, tainted)
+                source_records.append(
+                    {
+                        "id": source_id,
+                        "kind": "register",
+                        "name": reg_name,
+                        "bits": bits,
+                        "label": label,
+                    }
+                )
+                continue
+
+            raise ValueError(f"unsupported taint source kind: {kind!r}")
+
+        for callback in memory_monitors:
+            tracker.add_callback(callback, "mem_write", angr.BP_AFTER)
+
+        class _TaintSinkMonitor:
+            def __init__(
+                self,
+                specs: Sequence[Dict[str, Any]],
+                *,
+                tracker_obj: TaintTracker,
+                stop_first: bool,
+                max_hits_value: Optional[int],
+            ) -> None:
+                self._tracker = tracker_obj
+                self._stop_first = stop_first
+                self._max_hits = max_hits_value
+                self._address_map: Dict[int, List[Dict[str, Any]]] = {}
+                self._sinks: List[Dict[str, Any]] = []
+                self.hits: List[Dict[str, Any]] = []
+                self._recorded_keys: set[Tuple[str, int, Optional[int]]] = set()
+
+                for idx, spec in enumerate(specs):
+                    addr_value = _coerce_int(spec.get("address"), "address")
+                    sink_id = spec.get("id", f"sink_{idx}")
+                    mode = spec.get("mode", "any").lower()
+                    if mode not in {"any", "all"}:
+                        raise ValueError(f"unsupported sink mode: {mode}")
+
+                    checks_internal: List[Dict[str, Any]] = []
+                    checks_summary: List[Dict[str, Any]] = []
+                    for check_spec in spec.get("checks", []):
+                        kind = check_spec.get("kind")
+                        if kind == "register":
+                            entry = {
+                                "kind": "register",
+                                "name": check_spec["name"],
+                            }
+                        elif kind == "memory":
+                            entry = {
+                                "kind": "memory",
+                                "address": _coerce_int(check_spec.get("address"), "address"),
+                                "size": int(check_spec.get("size", 1)),
+                            }
+                            if entry["size"] <= 0:
+                                raise ValueError("memory sink check size must be positive")
+                        elif kind == "pointer":
+                            entry = {
+                                "kind": "pointer",
+                                "register": check_spec["register"],
+                                "size": int(check_spec.get("size", 1)),
+                            }
+                            if entry["size"] <= 0:
+                                raise ValueError("pointer sink check size must be positive")
+                        else:
+                            raise ValueError(f"unsupported sink check kind: {kind!r}")
+                        checks_internal.append(entry)
+                        checks_summary.append(_sanitize_check(check_spec))
+
+                    entry = {
+                        "id": sink_id,
+                        "address": addr_value,
+                        "address_hex": _format_addr(addr_value),
+                        "description": spec.get("description"),
+                        "mode": mode,
+                        "checks_internal": checks_internal,
+                        "checks": checks_summary,
+                        "hits": 0,
+                    }
+                    self._sinks.append(entry)
+                    self._address_map.setdefault(addr_value, []).append(entry)
+
+            def register(self) -> None:
+                if not self._sinks:
+                    return
+                self._tracker.add_callback(self._on_block, "irsb", angr.BP_BEFORE)
+
+            def describe(self) -> List[Dict[str, Any]]:
+                return [
+                    {
+                        "id": sink["id"],
+                        "address": sink["address_hex"],
+                        "description": sink.get("description"),
+                        "mode": sink["mode"],
+                        "checks": sink["checks"],
+                        "hits": sink["hits"],
+                    }
+                    for sink in self._sinks
+                ]
+
+            def process_state(self, state: angr.SimState) -> None:
+                for sink in self._matching_sinks(state):
+                    self._evaluate_and_record(state, sink)
+
+            def _matching_sinks(self, state: angr.SimState) -> List[Dict[str, Any]]:
+                addr_candidates = {int(getattr(state, "addr", 0) or 0)}
+                hist_addr = getattr(getattr(state, "history", None), "addr", None)
+                if hist_addr is not None:
+                    addr_candidates.add(int(hist_addr))
+
+                matching_ids = set()
+                for addr in addr_candidates:
+                    for sink in self._address_map.get(addr, []):
+                        matching_ids.add(id(sink))
+                if not matching_ids:
+                    return []
+
+                return [sink for sink in self._sinks if id(sink) in matching_ids]
+
+            def _evaluate_check(self, state: angr.SimState, spec: Dict[str, Any]) -> Dict[str, Any]:
+                kind = spec["kind"]
+                details: Dict[str, Any]
+                tainted = False
+                if kind == "register":
+                    reg_name = spec["name"]
+                    value = getattr(state.regs, reg_name)
+                    tainted = bool(is_tainted(value, state))
+                    details = {"register": reg_name}
+                    try:
+                        details["value"] = _format_addr(int(state.solver.eval(value)))
+                    except Exception:  # pylint:disable=broad-except
+                        pass
+                elif kind == "memory":
+                    address = spec["address"]
+                    size = spec["size"]
+                    value = state.memory.load(address, size)
+                    tainted = bool(is_tainted(value, state))
+                    details = {"address": _format_addr(address), "size": size}
+                elif kind == "pointer":
+                    reg_name = spec["register"]
+                    size = spec["size"]
+                    ptr = getattr(state.regs, reg_name)
+                    details = {"register": reg_name, "size": size}
+                    try:
+                        ptr_addr = int(state.solver.eval(ptr))
+                    except Exception:  # pylint:disable=broad-except
+                        ptr_addr = None
+                    if ptr_addr is not None:
+                        details["deref_address"] = _format_addr(ptr_addr)
+                        value = state.memory.load(ptr_addr, size)
+                    tainted = bool(is_tainted(value, state))
+                else:
+                    raise ValueError(f"unsupported sink check kind: {kind!r}")
+                return {"kind": kind, "tainted": tainted, "details": details}
+
+            def _on_block(self, state: angr.SimState) -> None:
+                for sink in self._matching_sinks(state):
+                    self._evaluate_and_record(state, sink)
+
+            def _evaluate_and_record(self, state: angr.SimState, sink: Dict[str, Any]) -> None:
+                check_specs = sink["checks_internal"]
+                check_results = [self._evaluate_check(state, spec) for spec in check_specs]
+                if check_specs:
+                    if sink["mode"] == "all":
+                        triggered = all(item["tainted"] for item in check_results)
+                    else:
+                        triggered = any(item["tainted"] for item in check_results)
+                else:
+                    triggered = True
+                if not triggered:
+                    return
+
+                state_addr = int(getattr(state, "addr", 0) or 0)
+                hist_addr = getattr(getattr(state, "history", None), "addr", None)
+                key = (sink["id"], state_addr, int(hist_addr) if hist_addr is not None else None)
+                if key in self._recorded_keys:
+                    return
+                self._recorded_keys.add(key)
+
+                sink["hits"] += 1
+                snapshot = state.copy()
+                record = {
+                    "sink_id": sink["id"],
+                    "sink_address": sink["address_hex"],
+                    "description": sink.get("description"),
+                    "mode": sink["mode"],
+                    "checks": check_results,
+                    "state_addr": _format_addr(state_addr),
+                    "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+                    "state_snapshot": snapshot,
+                }
+                self.hits.append(record)
+                if self._stop_first:
+                    self._tracker.stop()
+                if self._max_hits is not None and len(self.hits) >= self._max_hits:
+                    self._tracker.stop()
+
+        monitor = _TaintSinkMonitor(
+            sinks or [],
+            tracker_obj=tracker,
+            stop_first=stop_on_first_hit,
+            max_hits_value=max_sink_hits,
+        )
+        monitor.register()
+
+        if use_dfs:
+            simgr.use_technique(DFS())
+
+        for tech_name in techniques or []:
+            technique = self._load_technique(tech_name, project)
+            if technique is not None:
+                simgr.use_technique(technique)
+
+        simgr.use_technique(tracker)
+
+        budget_limiter: Optional[StateBudgetLimiter] = None
+        budget_error: Optional[StateBudgetExceeded] = None
+        state_pressure: Optional[Dict[str, Any]] = None
+        errors: List[Dict[str, str]] = []
+
+        if state_budget is not None:
+            budget_limiter = StateBudgetLimiter(state_budget, stashes=budget_stashes)
+            simgr.use_technique(budget_limiter)
+
+        try:
+            if max_steps is not None:
+                simgr.run(n=max_steps)
+            else:
+                simgr.run()
+        except StateBudgetExceeded as exc:
+            budget_error = exc
+            errors.append({"type": type(exc).__name__, "message": str(exc)})
+        except Exception as exc:  # pylint:disable=broad-except
+            errors.append({"type": type(exc).__name__, "message": str(exc)})
+
+        if budget_limiter is not None or budget_error is not None:
+            if budget_error is not None:
+                counts = dict(budget_error.stash_counts)
+                total = budget_error.total
+                status = "exceeded"
+            else:
+                counts = dict(budget_limiter.last_counts)
+                total = sum(counts.values())
+                status = "ok"
+            state_pressure = {
+                "status": status,
+                "budget": state_budget,
+                "total": total,
+                "stashes": counts,
+            }
+
+        for stash_name in ("active", "deadended", "found", "avoid"):
+            for st in getattr(simgr, stash_name, []) or []:
+                monitor.process_state(st)
+        for err in getattr(simgr, "errored", []) or []:
+            monitor.process_state(err.state)
+
+        result = self._collect_run_result(
+            project_id,
+            simgr_id,
+            simgr,
+            extra_errors=errors or None,
+            state_pressure=state_pressure,
+        )
+
+        sink_hits: List[Dict[str, Any]] = []
+        for hit in monitor.hits:
+            snapshot = hit.pop("state_snapshot")
+            snapshot_id = registry.register_state(project_id, snapshot)
+            streams = self._dump_streams(snapshot)
+            if streams:
+                result.streams[snapshot_id] = streams
+            alerts = self._run_alert_detectors(ctx, project_id, snapshot_id, snapshot)
+            if alerts:
+                result.alerts.extend(alerts)
+            hit["state_id"] = snapshot_id
+            sink_hits.append(hit)
+
+        result.taint_hits = sink_hits
+
+        run_payload = dict(result.__dict__)
+        run_payload["taint_hits"] = sink_hits
+
+        taint_summary = {
+            "sources": source_records,
+            "sinks": monitor.describe(),
+            "hits": sink_hits,
+        }
+        if state_pressure is not None:
+            taint_summary["state_pressure"] = state_pressure
+
+        return {"run": run_payload, "taint": taint_summary}
 
     # ------------------------------------------------------------------
     def monitor_for_vulns(

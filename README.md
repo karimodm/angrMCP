@@ -33,6 +33,9 @@ found.
 - `tests/test_deep_call_partition.py` – Deep-call regression that builds a
   branching binary, extracts call chains, enforces state-budget guards, and
   demonstrates chunked symbolic execution reaching a buried target function.
+- `tests/test_taint_analysis.py` – Format-string taint regression that
+  exercises pointer-aware taint sources and verifies sinks triggered through
+  the new taint-analysis MCP handler.
 - `pyproject.toml` – Minimal configuration enabling `uv` to manage a local
   virtual environment.
 - `schemas/` – JSON Schema Draft 2020-12 definitions for every MCP handler
@@ -81,21 +84,25 @@ MCP transport:
    registers/updates a job handle that can be resumed later. Use the optional
    `state_budget` parameter to detect and short-circuit state explosion; the
    run metadata reports the per-stash counts so clients can adapt chunk sizes.
-5. `monitor_for_vulns` – register inspection breakpoints (e.g., `mem_write`)
+5. `run_taint_analysis` – drive the vendored taint engine against a recorded
+   state. Define taint *sources* (memory/register or pointer-aware monitors),
+   specify *sinks* at target basic-block addresses, and receive structured hit
+   records plus state snapshots whenever taint reaches the sink.
+6. `monitor_for_vulns` – register inspection breakpoints (e.g., `mem_write`)
    so exploit-relevant actions are recorded (alerts accumulate alongside raw
    event logs).
-6. `inspect_state` – fetch registers, memory, constraint sets, recorded
+7. `inspect_state` – fetch registers, memory, constraint sets, recorded
    events, and generated alerts for any stored state.
-7. `solve_constraints` – query Claripy for concrete inputs/ranges from the
+8. `solve_constraints` – query Claripy for concrete inputs/ranges from the
    current constraints.
-8. `list_jobs`, `resume_job`, and `delete_job` – manage persisted simulation
+9. `list_jobs`, `resume_job`, and `delete_job` – manage persisted simulation
    jobs (list metadata, hydrate back into memory, or remove from registry/disk).
-9. `analyze_call_chain` – compute call-graph paths between functions so deep
+10. `analyze_call_chain` – compute call-graph paths between functions so deep
    targets can be decomposed into manageable exploration stages.
-10. `trace_dataflow` – run backward slices (optionally with DDG/CDG) to expose
+11. `trace_dataflow` – run backward slices (optionally with DDG/CDG) to expose
     dependencies that matter for a chosen target.
 
-## Current Status (October 25, 2025)
+## Current Status (October 29, 2025)
 
 - Core MCP plumbing is in place with registry-backed state tracking and
   resilient execution (errors are captured and returned to clients).
@@ -114,6 +121,9 @@ MCP transport:
 - `run_symbolic_search` accepts a `state_budget` cap and reports detailed
   state-pressure telemetry when the limit is approached or exceeded, allowing
   front-ends to shrink their search windows before the solver explodes.
+- The new `run_taint_analysis` handler wraps the angr taint engine with
+  pointer-aware taint sources and sink-level taint checks, returning structured
+  hit metadata and fresh state snapshots for downstream analysis.
 - Helper utilities in `angr_mcp/utils/` expose section scanners and literal
   cross-references used to automate angr CTF level analysis.
 - Jobs created via `run_symbolic_search` can be resumed, enumerated, and
@@ -128,9 +138,11 @@ MCP transport:
 - Integration tests validate the exploit-oriented workflow end to end (requires
   installing `claripy` and `angr` via `uv pip`). Supplementary Phase 1 CTF
   tests assert deterministic solutions for levels 00–04 in
-  `tests/test_phase1_ctf.py`. The newly added deep-call regression (`tests/
-  test_deep_call_partition.py`) stresses the call-chain handler, state-budget
-  feedback, and chunked symbolic execution needed for very deep targets.
+  `tests/test_phase1_ctf.py`. The deep-call regression
+  (`tests/test_deep_call_partition.py`) stresses the call-chain handler,
+  state-budget feedback, and chunked symbolic execution needed for very deep
+  targets. The new taint regression (`tests/test_taint_analysis.py`) proves that
+  taint from symbolic stdin can be tracked into a vulnerable `printf` call.
 
 ## Phase 1 angr_ctf Coverage Highlights
 

@@ -87,6 +87,13 @@ for future human or agent contributors working on the angr MCP server project.
 15. Landed the deep-call regression (`tests/test_deep_call_partition.py`) that
     compiles a wide branch tree and demonstrates chunked exploration via the
     new call-chain handler and state-budget feedback.
+16. Vendored the angr taint engine, exposing it through a new MCP handler
+    (`run_taint_analysis`) that supports pointer-aware taint sources,
+    sink-specific taint checks, and structured hit reporting for downstream
+    agents.
+17. Added `tests/test_taint_analysis.py`, compiling a format-string sample and
+    asserting that taint from symbolic stdin propagates into the `printf`
+    format argument via the new pointer-based source monitors.
 
 ## Collaboration Rules
 
@@ -115,6 +122,9 @@ for future human or agent contributors working on the angr MCP server project.
   validation in CI once `jsonschema` is bundled.
 - Enhance tests with multiple architectures and binaries once additional
   dependencies are in place.
+- Grow the taint tooling with higher-level policies (e.g., standard source/sink
+  presets, automatic syscall coverage) and richer hit metadata once agents
+  exercise the new handler in practice.
 
 Keep this guide synchronized with actual project state after each session so
 future agents can resume work without rediscovering context.
