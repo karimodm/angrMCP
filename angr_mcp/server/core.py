@@ -56,6 +56,7 @@ class RunResult:
     predicate_matches: List[Dict[str, Any]] = field(default_factory=list)
     state_pressure: Optional[Dict[str, Any]] = None
     taint_hits: List[Dict[str, Any]] = field(default_factory=list)
+    hints: List[str] = field(default_factory=list)
 
 
 class PredicateEngine:
@@ -783,8 +784,8 @@ class AngrMCPServer:
         avoid: Optional[List[int]] = None,
         step_count: int = 1,
         techniques: Optional[List[str]] = None,
-        state_budget: Optional[int] = None,
-        budget_stashes: Optional[Sequence[str]] = None,
+        state_budget: Optional[int] = 256,
+        budget_stashes: Optional[Sequence[str]] = ("active", "deferred", "found", "avoid", "errored"),
         persist_job: bool = False,
         job_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -801,6 +802,20 @@ class AngrMCPServer:
         avoid_engine = PredicateEngine("avoid", avoid_runtime)
         find_callable = find_engine.as_callable()
         avoid_callable = avoid_engine.as_callable()
+
+        discipline_hints: List[str] = []
+
+        if state_budget is None:
+            state_budget = 256
+            discipline_hints.append(
+                "state_budget not provided; defaulted to 256 to prevent solver blowup"
+            )
+
+        if budget_stashes is None:
+            budget_stashes = ("active", "deferred", "found", "avoid", "errored")
+
+        if mode == "explore" and not find_runtime and not avoid_runtime:
+            discipline_hints.append("no find/avoid predicates supplied; run may wander arbitrarily")
 
         if job_id:
             try:
@@ -919,6 +934,7 @@ class AngrMCPServer:
         if avoid_engine.has_predicates():
             predicate_matches.extend(avoid_engine.matches)
         result.predicate_matches = predicate_matches
+        result.hints = discipline_hints
 
         stash_map = result.stashes or {
             "active": result.active,

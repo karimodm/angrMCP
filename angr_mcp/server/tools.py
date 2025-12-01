@@ -248,8 +248,8 @@ def run_symbolic_search(
     avoid: Optional[List[int]] = None,
     step_count: int = 1,
     techniques: Optional[List[str]] = None,
-    state_budget: Optional[int] = None,
-    budget_stashes: Optional[Sequence[str]] = None,
+    state_budget: Optional[int] = 256,
+    budget_stashes: Optional[Sequence[str]] = ("active", "deferred", "found", "avoid", "errored"),
     persist_job: bool = False,
     job_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -258,10 +258,11 @@ def run_symbolic_search(
     Use this when you need block-by-block reachability instead of whole-function
     views. Symbolic execution will traverse concrete basic blocks, revealing the
     precise branch predicates and successor states that static decompilation
-    glosses over. Tip: treat the run as a bounded, repeatable step—always set
-    ``state_budget`` (and optionally ``budget_stashes``) so the solver cannot
-    explode on large programs, and consider ``persist_job=True`` to resume the
-    run in short, controlled bursts (e.g. 100–200 total states at a time).
+    glosses over. This call now defaults to a conservative ``state_budget=256``
+    and common ``budget_stashes`` so the solver cannot explode silently; bump or
+    relax these only when you truly need more breadth. Prefer short, repeatable
+    bursts with ``find``/``avoid`` predicates, and consider ``persist_job=True``
+    to resume multi-hop paths without restarting from entry.
 
     Args:
         project_id: Identifier returned by :func:`load_project`.
@@ -615,6 +616,7 @@ __all__ = [
     "mutate_state",
     "add_constraints",
     "run_symbolic_search",
+    "run_taint_analysis",
     "monitor_for_vulns",
     "list_jobs",
     "resume_job",
