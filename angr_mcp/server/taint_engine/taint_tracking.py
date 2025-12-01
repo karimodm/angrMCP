@@ -167,8 +167,8 @@ class TaintTracker(ExplorationTechnique):
     """
 
     def __init__(self,
-                 interfunction_level=0,
-                 smart_call=True,
+                 interfunction_level=5,
+                 smart_call=False,
                  precise_argument_check=True,
                  follow_unsat=True,
                  function_whitelist=[],
@@ -671,7 +671,8 @@ class TaintTracker(ExplorationTechnique):
             s.globals[GLOB_TAINT_DEP_KEY] = {}
             s.globals[UNTAINT_DATA] = {UNTAINTED_VARS: [], SEEN_MASTERS: []}
             s.globals[CURRENT_IFL] = self._interfunction_level
-            s.globals[TAINT_APPLIED] = False
+            if TAINT_APPLIED not in s.globals:
+                s.globals[TAINT_APPLIED] = False
             s.globals[BACK_JUMPS] = {}
 
             # flags

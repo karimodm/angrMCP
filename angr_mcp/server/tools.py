@@ -1,8 +1,7 @@
-"""FastMCP tool registrations and thin wrappers around :mod:`angr_mcp.server.core`."""
-
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from mcp.server.fastmcp import FastMCP
@@ -25,8 +24,24 @@ for _logger_name in _NOISY_LOGGERS:
 mcp = FastMCP("angr-mcp", log_level="WARNING")
 SERVER = AngrMCPServer()
 
+# Check if running in taint-only mode
+TAINT_ONLY_MODE = os.environ.get("ANGR_MCP_TAINT_ONLY", "0") == "1"
 
-@mcp.tool()
+
+# Define tool registration helpers
+def _register_low_level_tool(func):
+    """Only register this tool if not in taint-only mode."""
+    if not TAINT_ONLY_MODE:
+        return mcp.tool()(func)
+    return func
+
+
+def _register_high_level_tool(func):
+    """Always register this tool."""
+    return mcp.tool()(func)
+
+
+@_register_low_level_tool
 def load_project(
     binary_path: str,
     *,
@@ -68,7 +83,7 @@ def load_project(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def setup_symbolic_context(
     project_id: str,
     *,
@@ -135,7 +150,7 @@ def setup_symbolic_context(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def instrument_environment(
     project_id: str,
     hooks: List[Dict[str, Any]],
@@ -161,7 +176,7 @@ def instrument_environment(
     return SERVER.instrument_environment(project_id, hooks)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def mutate_state(
     project_id: str,
     state_id: str,
@@ -207,7 +222,7 @@ def mutate_state(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def add_constraints(
     project_id: str,
     state_id: str,
@@ -236,7 +251,7 @@ def add_constraints(
     return SERVER.add_constraints(project_id, state_id, constraints)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def run_symbolic_search(
     project_id: str,
     *,
@@ -303,7 +318,7 @@ def run_symbolic_search(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def run_taint_analysis(
     project_id: str,
     *,
@@ -317,6 +332,8 @@ def run_taint_analysis(
     max_sink_hits: Optional[int] = None,
     state_budget: Optional[int] = None,
     budget_stashes: Optional[Sequence[str]] = None,
+    interfunction_level: int = 5,
+    smart_call: bool = False,
     max_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Track how tainted data flows through the program.
@@ -365,11 +382,73 @@ def run_taint_analysis(
         max_sink_hits=max_sink_hits,
         state_budget=state_budget,
         budget_stashes=budget_stashes,
+        interfunction_level=interfunction_level,
+        smart_call=smart_call,
         max_steps=max_steps,
     )
 
 
-@mcp.tool()
+@_register_high_level_tool
+def analyze_taint(
+    binary_path: str,
+    *,
+    function_name: Optional[str] = None,
+    function_address: Optional[int] = None,
+    args: Optional[List[Any]] = None,
+    sources: Optional[Sequence[Dict[str, Any]]] = None,
+    sinks: Optional[Sequence[Dict[str, Any]]] = None,
+    interfunction_level: int = 5,
+    smart_call: bool = False,
+    auto_load_libs: bool = False,
+) -> Dict[str, Any]:
+    """All-in-one taint analysis: load binary, setup context, and run analysis.
+
+    This is the recommended high-level tool for taint analysis. It handles the
+    entire workflow in one go: loading the binary, setting up the symbolic state,
+    and running the taint analysis.
+
+    Args:
+        binary_path: Path to the binary to analyze.
+        function_name: Name of the function to analyze. If not provided, starts from entry.
+        function_address: Address of the function to analyze (alternative to function_name).
+        args: Arguments to pass to the function (or argv for entry state).
+        sources: Taint sources. Each source should specify:
+            - ``kind``: \"memory\" or \"register\"
+            - For memory: ``address`` and ``size``
+            - ``label``: optional label for the taint
+        sinks: Taint sinks. Each sink should specify:
+            - ``address``: Address where to check for taint
+            - ``checks``: List of checks, each with:
+                - ``kind``: \"register\", \"memory\", or \"pointer\"
+                - For register: ``name`` (register name)
+                - For memory: ``address`` and ``size``
+                - For pointer: ``register`` (register containing pointer) and ``size``
+        interfunction_level: Maximum depth for inter-function analysis (default: 5).
+        smart_call: If True, only follow calls when arguments are tainted (default: False).
+        auto_load_libs: If True, load shared libraries (default: False).
+
+    Returns:
+        Dictionary containing:
+            - ``project_id``: Project identifier for further operations
+            - ``state_id``: Initial state identifier
+            - ``taint``: Taint analysis results with sources, sinks, and hits
+            - ``metadata``: Binary metadata
+    """
+
+    return SERVER.analyze_taint(
+        binary_path,
+        function_name=function_name,
+        function_address=function_address,
+        args=args,
+        sources=sources,
+        sinks=sinks,
+        interfunction_level=interfunction_level,
+        smart_call=smart_call,
+        auto_load_libs=auto_load_libs,
+    )
+
+
+@_register_low_level_tool
 def monitor_for_vulns(
     project_id: str,
     state_id: str,
@@ -392,7 +471,7 @@ def monitor_for_vulns(
     return SERVER.monitor_for_vulns(project_id, state_id, events)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def list_jobs(project_id: str) -> Dict[str, Any]:
     """List symbolic execution jobs recorded for the given project.
 
@@ -409,7 +488,7 @@ def list_jobs(project_id: str) -> Dict[str, Any]:
     return SERVER.list_jobs(project_id)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def resume_job(project_id: str, job_id: str) -> Dict[str, Any]:
     """Reload a previously recorded symbolic execution job.
 
@@ -428,7 +507,7 @@ def resume_job(project_id: str, job_id: str) -> Dict[str, Any]:
     return SERVER.resume_job(project_id, job_id)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def delete_job(
     project_id: str,
     job_id: str,
@@ -452,7 +531,7 @@ def delete_job(
     return SERVER.delete_job(project_id, job_id, remove_disk=remove_disk)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def inspect_state(
     project_id: str,
     state_id: str,
@@ -501,7 +580,7 @@ def inspect_state(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def solve_constraints(
     project_id: str,
     state_id: str,
@@ -530,7 +609,7 @@ def solve_constraints(
     return SERVER.solve_constraints(project_id, state_id, queries)
 
 
-@mcp.tool()
+@_register_low_level_tool
 def analyze_call_chain(
     project_id: str,
     *,
@@ -569,7 +648,7 @@ def analyze_call_chain(
     )
 
 
-@mcp.tool()
+@_register_low_level_tool
 def trace_dataflow(
     project_id: str,
     *,
@@ -617,6 +696,7 @@ __all__ = [
     "add_constraints",
     "run_symbolic_search",
     "run_taint_analysis",
+    "analyze_taint",
     "monitor_for_vulns",
     "list_jobs",
     "resume_job",

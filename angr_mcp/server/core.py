@@ -1014,6 +1014,8 @@ class AngrMCPServer:
         max_sink_hits: Optional[int] = None,
         state_budget: Optional[int] = None,
         budget_stashes: Optional[Sequence[str]] = None,
+        interfunction_level: int = 5,
+        smart_call: bool = False,
         max_steps: Optional[int] = None,
     ) -> Dict[str, Any]:
         if not state_id:
@@ -1027,6 +1029,8 @@ class AngrMCPServer:
         simgr_id = registry.register_simmanager(project_id, simgr)
 
         tracker_kwargs = dict(tracker_options or {})
+        tracker_kwargs.setdefault("interfunction_level", interfunction_level)
+        tracker_kwargs.setdefault("smart_call", smart_call)
         tracker = TaintTracker(**tracker_kwargs)
 
         def _coerce_int(value: Any, name: str) -> int:
@@ -1483,6 +1487,69 @@ class AngrMCPServer:
             taint_summary["state_pressure"] = state_pressure
 
         return {"run": run_payload, "taint": taint_summary}
+
+    # ------------------------------------------------------------------
+    def analyze_taint(
+        self,
+        binary_path: str,
+        *,
+        function_name: Optional[str] = None,
+        function_address: Optional[int] = None,
+        args: Optional[List[Any]] = None,
+        sources: Optional[Sequence[Dict[str, Any]]] = None,
+        sinks: Optional[Sequence[Dict[str, Any]]] = None,
+        interfunction_level: int = 5,
+        smart_call: bool = False,
+        auto_load_libs: bool = False,
+    ) -> Dict[str, Any]:
+        """Unified tool for taint analysis."""
+        
+        # 1. Load Project
+        load_result = self.load_project(binary_path, auto_load_libs=auto_load_libs)
+        project_id = load_result["project_id"]
+        ctx = registry.get_project(project_id)
+        project = ctx.project
+
+        # 2. Setup Context
+        setup_kwargs = {}
+        if function_name:
+            sym = project.loader.find_symbol(function_name)
+            if not sym:
+                raise ValueError(f"Symbol {function_name} not found")
+            setup_kwargs["kind"] = "call"
+            setup_kwargs["addr"] = sym.rebased_addr
+            if args:
+                setup_kwargs["args"] = args
+        elif function_address:
+            setup_kwargs["kind"] = "call"
+            setup_kwargs["addr"] = function_address
+            if args:
+                setup_kwargs["args"] = args
+        else:
+            setup_kwargs["kind"] = "entry"
+            if args:
+                setup_kwargs["argv"] = args
+
+        setup_result = self.setup_symbolic_context(project_id, **setup_kwargs)
+        state_id = setup_result["state_id"]
+
+        # 3. Run Analysis
+        taint_result = self.run_taint_analysis(
+            project_id,
+            state_id=state_id,
+            sources=sources,
+            sinks=sinks,
+            stop_on_first_hit=True,
+            interfunction_level=interfunction_level,
+            smart_call=smart_call,
+        )
+
+        return {
+            "project_id": project_id,
+            "state_id": state_id,
+            "taint": taint_result["taint"],
+            "metadata": load_result["metadata"],
+        }
 
     # ------------------------------------------------------------------
     def monitor_for_vulns(
